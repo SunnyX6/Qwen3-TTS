@@ -31,6 +31,12 @@ dependencies = [
   "einops",
 ]
 
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+]
+
 [project.urls]
 Homepage = "https://github.com/Qwen/Qwen3-TTS"
 Repository = "https://github.com/Qwen/Qwen3-TTS"
