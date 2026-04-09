@@ -24,6 +24,42 @@ class CloneRequest(AudioRequestModel):
     refAudio: str
     refText: Optional[str] = None
     xVectorOnlyMode: bool = False
+    max_new_tokens: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("maxNewTokens", "max_new_tokens"),
+        serialization_alias="maxNewTokens",
+    )
+    temperature: Optional[float] = None
+    top_k: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("topK", "top_k"),
+        serialization_alias="topK",
+    )
+    top_p: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("topP", "top_p"),
+        serialization_alias="topP",
+    )
+    repetition_penalty: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("repetitionPenalty", "repetition_penalty"),
+        serialization_alias="repetitionPenalty",
+    )
+    subtalker_top_k: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("subtalkerTopK", "subtalker_top_k"),
+        serialization_alias="subtalkerTopK",
+    )
+    subtalker_top_p: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("subtalkerTopP", "subtalker_top_p"),
+        serialization_alias="subtalkerTopP",
+    )
+    subtalker_temperature: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("subtalkerTemperature", "subtalker_temperature"),
+        serialization_alias="subtalkerTemperature",
+    )
 
 
 class CustomVoiceRequest(AudioRequestModel):

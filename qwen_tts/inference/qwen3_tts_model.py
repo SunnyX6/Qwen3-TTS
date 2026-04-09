@@ -27,6 +27,10 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from ..path_utils import resolve_pretrained_model_ref
+
+PYTORCH_INSTALL_URL = "https://pytorch.org/get-started/locally/"
+FLASH_ATTN_DOC_URL = "https://github.com/Dao-AILab/flash-attention"
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -105,17 +109,43 @@ class Qwen3TTSModel:
             Qwen3TTSModel:
                 Wrapper instance containing `model`, `processor`, and generation defaults.
         """
+        models_dir = kwargs.pop("models_dir", None)
+        resolved_model_ref = resolve_pretrained_model_ref(pretrained_model_name_or_path, models_dir=models_dir)
+        requested_attn_implementation = kwargs.get("attn_implementation")
+        if requested_attn_implementation == "flash_attention_2":
+            try:
+                import flash_attn  # noqa: F401
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "`flash_attention_2` was requested, but the `flash_attn` package is not installed. "
+                    f"Please install `flash_attn` in the current environment. See: {FLASH_ATTN_DOC_URL}"
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"`flash_attn` is installed but failed to import: {type(exc).__name__}: {exc}. "
+                    f"Please fix the installation in the current environment. See: {FLASH_ATTN_DOC_URL}"
+                ) from exc
+        if kwargs.get("device_map") is not None:
+            try:
+                import accelerate  # noqa: F401
+            except ModuleNotFoundError as exc:
+                raise ModuleNotFoundError(
+                    "Loading Qwen3-TTS with `device_map` requires `accelerate`, which is not installed by default. "
+                    f"Install a PyTorch build that matches your machine from {PYTORCH_INSTALL_URL}, "
+                    "then install runtime dependencies with: pip install -e \".[runtime]\""
+                ) from exc
+
         AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
-        model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        model = AutoModel.from_pretrained(resolved_model_ref, **kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
 
-        processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
+        processor = AutoProcessor.from_pretrained(resolved_model_ref, fix_mistral_regex=True,)
 
         generate_defaults = model.generate_config
         return cls(model=model, processor=processor, generate_defaults=generate_defaults)

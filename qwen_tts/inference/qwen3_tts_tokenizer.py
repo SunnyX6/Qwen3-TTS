@@ -15,7 +15,9 @@
 # limitations under the License.
 import base64
 import io
+import json
 import urllib.request
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -25,13 +27,14 @@ import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
+from transformers.utils.hub import cached_file
 
-from ..core import (
-    Qwen3TTSTokenizerV1Config,
-    Qwen3TTSTokenizerV1Model,
-    Qwen3TTSTokenizerV2Config,
-    Qwen3TTSTokenizerV2Model,
-)
+from ..core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
+from ..core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Model
+from ..core.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Config
+from ..path_utils import resolve_pretrained_model_ref
+
+PYTORCH_INSTALL_URL = "https://pytorch.org/get-started/locally/"
 
 AudioInput = Union[
     str,  # wav path, or base64 string
@@ -39,6 +42,63 @@ AudioInput = Union[
     List[str],
     List[np.ndarray],
 ]
+
+
+def _safe_register_config(model_type: str, config_cls) -> None:
+    try:
+        AutoConfig.register(model_type, config_cls)
+    except ValueError:
+        pass
+
+
+def _safe_register_model(config_cls, model_cls) -> None:
+    try:
+        AutoModel.register(config_cls, model_cls)
+    except ValueError:
+        pass
+
+
+def _load_pretrained_config_dict(pretrained_model_name_or_path: str) -> dict:
+    candidate = Path(pretrained_model_name_or_path)
+    if candidate.is_dir():
+        config_path = candidate / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Missing config.json under {candidate}")
+        return json.loads(config_path.read_text(encoding="utf-8"))
+
+    config_path = cached_file(pretrained_model_name_or_path, "config.json")
+    if config_path is None:
+        raise FileNotFoundError(f"Unable to locate config.json for {pretrained_model_name_or_path}")
+    return json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+
+def _load_tokenizer_v1_model_class():
+    try:
+        from ..core.tokenizer_25hz.modeling_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Model
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("torchaudio"):
+            raise ModuleNotFoundError(
+                "The 25Hz tokenizer requires `torchaudio`, which is not installed by default. "
+                f"Install a PyTorch + torchaudio build that matches your machine from {PYTORCH_INSTALL_URL} "
+                "before loading 25Hz tokenizer models."
+            ) from exc
+        raise
+    return Qwen3TTSTokenizerV1Model
+
+
+def _register_tokenizer_classes(pretrained_model_name_or_path: str) -> None:
+    _safe_register_config("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
+    _safe_register_config("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
+
+    config_dict = _load_pretrained_config_dict(pretrained_model_name_or_path)
+    model_type = config_dict.get("model_type")
+    if model_type == "qwen3_tts_tokenizer_25hz":
+        _safe_register_model(Qwen3TTSTokenizerV1Config, _load_tokenizer_v1_model_class())
+        return
+    if model_type == "qwen3_tts_tokenizer_12hz":
+        _safe_register_model(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
+        return
+    raise ValueError(f"Unsupported tokenizer model_type: {model_type}")
 
 
 class Qwen3TTSTokenizer:
@@ -77,15 +137,12 @@ class Qwen3TTSTokenizer:
                 Initialized instance with `model`, `feature_extractor`, `config`.
         """
         inst = cls()
+        models_dir = kwargs.pop("models_dir", None)
+        resolved_model_ref = resolve_pretrained_model_ref(pretrained_model_name_or_path, models_dir=models_dir)
+        _register_tokenizer_classes(resolved_model_ref)
 
-        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
-        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
-
-        AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
-        AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
-
-        inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
-        inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        inst.feature_extractor = AutoFeatureExtractor.from_pretrained(resolved_model_ref)
+        inst.model = AutoModel.from_pretrained(resolved_model_ref, **kwargs)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)

@@ -113,7 +113,10 @@ data/
 - `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
 - `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
 - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
+- `Qwen3-TTS-12Hz-1.7B-Base`
 - `data/voiceLibrary/voices/voice_xxx/model`
+
+> API and loaders now prefer the project-local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if it exists, and simple names like `Qwen3-TTS-12Hz-1.7B-Base` are treated as `./models/Qwen3-TTS-12Hz-1.7B-Base` by default.
 
 ### 3.2 `voice`
 
@@ -233,9 +236,23 @@ data/
   "refAudio": "data:audio/wav;base64,...",
   "refText": "欢迎来到我们的节目。",
   "xVectorOnlyMode": false,
-  "responseFormat": "base64"
+  "responseFormat": "base64",
+  "maxNewTokens": 8192,
+  "temperature": 0.9,
+  "topK": 50,
+  "topP": 1.0,
+  "repetitionPenalty": 1.05,
+  "subtalkerTopK": 50,
+  "subtalkerTopP": 1.0,
+  "subtalkerTemperature": 0.9
 }
 ```
+
+说明：
+
+- `xVectorOnlyMode = false` 时，必须传 `refText`
+- `refAudio` 现在会按 `demo.py` 的方式先做归一化，再送进模型
+- `maxNewTokens`、`temperature`、`topK`、`topP`、`repetitionPenalty`、`subtalkerTopK`、`subtalkerTopP`、`subtalkerTemperature` 都可以直接通过 API 透传给底层生成逻辑
 
 ---
 
@@ -544,13 +561,21 @@ start_api_windows.bat --host 0.0.0.0 --port 8000
 - `--dtype`
 - `--flash-attn`
 - `--data-dir`
+- `--models-dir`
+- `--workers`
 - `--max-gpu-queue-size`
 
 安装方式建议：
 
 ```bash
-pip install -e ".[api]"
+pip install -e ".[runtime,api]"
 ```
+
+> Before installing API dependencies, install a PyTorch build that matches the target machine from https://pytorch.org/get-started/locally/ . The project does not auto-pick a GPU-specific PyTorch build for users.
+
+> `--flash-attn` is enabled by default. If `flash_attn` is missing or broken, API startup now exits immediately with an installation hint instead of waiting until the first inference request fails.
+
+> `--workers` now defaults to `2`. This can improve throughput on capable GPUs, but each worker keeps its own model cache and its own GPU queue. If GPU memory is tight, lower it with `--workers 1`.
 
 ### 6.1 启动时设备选择
 

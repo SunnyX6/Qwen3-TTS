@@ -21,10 +21,8 @@ authors = [{ name = "Alibaba Qwen Team" }]
 
 dependencies = [
   "transformers==4.57.3",
-  "accelerate==1.12.0",
   "gradio",
   "librosa",
-  "torchaudio",
   "soundfile",
   "sox",
   "onnxruntime",
@@ -32,6 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+runtime = [
+  "accelerate==1.12.0",
+]
 api = [
   "fastapi>=0.115,<1",
   "uvicorn>=0.30,<1",

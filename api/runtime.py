@@ -20,6 +20,7 @@ from api.common import (
     guess_audio_extension,
     materialize_audio_input,
     read_json,
+    resolve_model_ref,
     resolve_relative_url,
     resolve_training_audio_dir,
     write_json,
@@ -40,28 +41,31 @@ def parse_dtype(value: str) -> torch.dtype:
 
 
 class ModelManager:
-    def __init__(self, device: str, dtype: str, flash_attn: bool):
+    def __init__(self, device: str, dtype: str, flash_attn: bool, models_dir: Path):
         self.device = device
         self.dtype = dtype
         self.flash_attn = flash_attn
+        self.models_dir = models_dir
         self._cache: Dict[str, Qwen3TTSModel] = {}
         self._lock = threading.Lock()
 
     def get(self, model_id: str) -> Qwen3TTSModel:
+        resolved_model_id = resolve_model_ref(model_id, self.models_dir)
         with self._lock:
-            cached = self._cache.get(model_id)
+            cached = self._cache.get(resolved_model_id)
             if cached is not None:
                 return cached
 
             self._clear_locked()
             attn_impl = "flash_attention_2" if self.flash_attn else None
             model = Qwen3TTSModel.from_pretrained(
-                model_id,
+                resolved_model_id,
                 device_map=self.device,
                 dtype=parse_dtype(self.dtype),
                 attn_implementation=attn_impl,
+                models_dir=self.models_dir,
             )
-            self._cache = {model_id: model}
+            self._cache = {resolved_model_id: model}
             return model
 
     def clear(self) -> None:
@@ -180,12 +184,13 @@ class GpuJobScheduler:
 class AppState:
     def __init__(self, config: ServerConfig):
         self.config = config
-        self.models = ModelManager(config.device, config.dtype, config.flash_attn)
+        self.models = ModelManager(config.device, config.dtype, config.flash_attn, config.models_dir)
         self.tasks = TrainTaskStore()
         self.scheduler = GpuJobScheduler(config.max_gpu_queue_size)
         ensure_dir(config.data_dir)
         ensure_dir(config.data_dir / "voiceLibrary" / "drafts")
         ensure_dir(config.data_dir / "voiceLibrary" / "voices")
+        ensure_dir(config.models_dir)
 
     def draft_dir(self, task_id: str) -> Path:
         return self.config.data_dir / "voiceLibrary" / "drafts" / task_id
@@ -313,6 +318,8 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
     dataset_dir, dataset_external = resolve_training_audio_dir(draft_dir / "dataset", payload)
 
     try:
+        resolved_model_id = resolve_model_ref(payload["modelId"], state.config.models_dir)
+        resolved_tokenizer_model_id = resolve_model_ref(payload["tokenizerModelId"], state.config.models_dir)
         state.models.clear()
         running_meta = update_task_meta(
             draft_dir,
@@ -345,7 +352,7 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
                 "--device",
                 state.config.device,
                 "--tokenizer_model_path",
-                payload["tokenizerModelId"],
+                resolved_tokenizer_model_id,
                 "--input_jsonl",
                 str(raw_jsonl.resolve()),
                 "--output_jsonl",
@@ -360,7 +367,7 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
                 sys.executable,
                 "sft_12hz.py",
                 "--init_model_path",
-                payload["modelId"],
+                resolved_model_id,
                 "--output_model_path",
                 str(training_dir.resolve()),
                 "--train_jsonl",

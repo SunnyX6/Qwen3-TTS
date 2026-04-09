@@ -19,7 +19,14 @@ import os
 import shutil
 
 import torch
-from accelerate import Accelerator
+try:
+    from accelerate import Accelerator
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "Fine-tuning requires `accelerate`, which is not installed by default. "
+        "Install a PyTorch build that matches your machine from https://pytorch.org/get-started/locally/, "
+        "then install runtime dependencies with: pip install -e \".[runtime]\""
+    ) from exc
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file

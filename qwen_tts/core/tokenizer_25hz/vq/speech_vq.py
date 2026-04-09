@@ -21,7 +21,12 @@ import onnxruntime
 
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio.compliance.kaldi as kaldi
+try:
+    import torchaudio.compliance.kaldi as kaldi
+    _TORCHAUDIO_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    kaldi = None
+    _TORCHAUDIO_IMPORT_ERROR = exc
 
 from librosa.filters import mel as librosa_mel_fn
 from itertools import accumulate
@@ -30,6 +35,14 @@ from torch import Tensor
 
 from .core_vq import DistributedGroupResidualVectorQuantization
 from .whisper_encoder import WhisperEncoder, Conv1d, ConvTranspose1d
+
+
+def _raise_missing_torchaudio() -> None:
+    raise ModuleNotFoundError(
+        "The 25Hz tokenizer requires `torchaudio`, which is not installed by default. "
+        "Install a PyTorch + torchaudio build that matches your machine from "
+        "https://pytorch.org/get-started/locally/ before using 25Hz tokenizer models."
+    ) from _TORCHAUDIO_IMPORT_ERROR
 
 
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
@@ -118,6 +131,8 @@ class MelSpectrogramFeatures(nn.Module):
 class XVectorExtractor(nn.Module):
     def __init__(self, audio_codec_with_xvector):
         super().__init__()
+        if kaldi is None:
+            _raise_missing_torchaudio()
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1

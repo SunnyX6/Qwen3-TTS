@@ -83,39 +83,45 @@ During model loading in the qwen-tts package or vLLM, model weights will be auto
 ```bash
 # Download through ModelScope (recommended for users in Mainland China)
 pip install -U modelscope
-modelscope download --model Qwen/Qwen3-TTS-Tokenizer-12Hz  --local_dir ./Qwen3-TTS-Tokenizer-12Hz 
-modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local_dir ./Qwen3-TTS-12Hz-1.7B-CustomVoice
-modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local_dir ./Qwen3-TTS-12Hz-1.7B-VoiceDesign
-modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./Qwen3-TTS-12Hz-1.7B-Base
-modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local_dir ./Qwen3-TTS-12Hz-0.6B-CustomVoice
-modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ./Qwen3-TTS-12Hz-0.6B-Base
+modelscope download --model Qwen/Qwen3-TTS-Tokenizer-12Hz  --local_dir ./models/Qwen3-TTS-Tokenizer-12Hz 
+modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local_dir ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local_dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-Base --local_dir ./models/Qwen3-TTS-12Hz-1.7B-Base
+modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local_dir ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+modelscope download --model Qwen/Qwen3-TTS-12Hz-0.6B-Base --local_dir ./models/Qwen3-TTS-12Hz-0.6B-Base
 
 # Download through Hugging Face
 pip install -U "huggingface_hub[cli]"
-huggingface-cli download Qwen/Qwen3-TTS-Tokenizer-12Hz --local-dir ./Qwen3-TTS-Tokenizer-12Hz
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ./Qwen3-TTS-12Hz-1.7B-CustomVoice
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./Qwen3-TTS-12Hz-1.7B-VoiceDesign
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir ./Qwen3-TTS-12Hz-1.7B-Base
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir ./Qwen3-TTS-12Hz-0.6B-CustomVoice
-huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ./Qwen3-TTS-12Hz-0.6B-Base
+huggingface-cli download Qwen/Qwen3-TTS-Tokenizer-12Hz --local-dir ./models/Qwen3-TTS-Tokenizer-12Hz
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local-dir ./models/Qwen3-TTS-12Hz-1.7B-CustomVoice
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --local-dir ./models/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-1.7B-Base --local-dir ./models/Qwen3-TTS-12Hz-1.7B-Base
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir ./models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ./models/Qwen3-TTS-12Hz-0.6B-Base
 ```
+
+When running from the project root, the loaders and API now prefer the local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if that folder exists; simple names like `Qwen3-TTS-12Hz-1.7B-Base` are also resolved from `./models` by default.
 
 
 ## Quickstart
 
 ### Environment Setup
 
-The easiest way to quickly use Qwen3-TTS is to install the `qwen-tts` Python package from PyPI. This will pull in the required runtime dependencies and allow you to load any released Qwen3-TTS model. We recommend using a **fresh, isolated environment** to avoid dependency conflicts with existing packages. You can create a clean Python 3.12 environment like this:
+The easiest way to quickly use Qwen3-TTS is to install the `qwen-tts` Python package from PyPI after preparing a matching PyTorch environment for your machine. We recommend using a **fresh, isolated environment** to avoid dependency conflicts with existing packages. You can create a clean Python 3.12 environment like this:
 
 ```bash
 conda create -n qwen3-tts python=3.12 -y
 conda activate qwen3-tts
 ```
 
-then run:
+Then install a PyTorch build that matches your machine from the official selector:
+
+- https://pytorch.org/get-started/locally/
+
+After PyTorch is installed, run:
 
 ```bash
-pip install -U qwen-tts
+pip install -U qwen-tts accelerate
 ```
 
 If you want to develop or modify the code locally, install from source in editable mode.
@@ -123,8 +129,22 @@ If you want to develop or modify the code locally, install from source in editab
 ```bash
 git clone https://github.com/QwenLM/Qwen3-TTS.git
 cd Qwen3-TTS
-pip install -e .
+pip install -e ".[runtime]"
 ```
+
+If you want to run the API server from source, install the API dependencies as well:
+
+```bash
+pip install -e ".[runtime,api]"
+```
+
+The included launcher scripts (`start_api_mac.sh` and `start_api_windows.bat`) only use the project-local Conda environment at `./py312`. If you want to start the API through those scripts, create `py312` in the repository root, install a matching PyTorch build first, and then install `.[runtime,api]`. The scripts now ask whether to enable FlashAttention: choose `Y` to use it (and they will show the install command if `flash_attn` is missing), or choose `N` to start with `--no-flash-attn`.
+
+The API now starts with `--workers 2` by default. This can improve GPU utilization under concurrent requests, but each worker keeps its own model cache and GPU queue, so GPU memory usage will increase accordingly. If VRAM is tight, start with `--workers 1`.
+
+The 25Hz tokenizer path requires `torchaudio`, which is intentionally not installed by default. If you need 25Hz tokenizer models, install a matching PyTorch + torchaudio build from the official PyTorch selector before using them.
+
+If API startup keeps the default `--flash-attn`, the server now fails fast when `flash_attn` is missing or broken and asks you to install it in the current environment instead of deferring that error until the first generation request.
 
 Additionally, we recommend using FlashAttention 2 to reduce GPU memory usage.
 
@@ -392,6 +412,8 @@ qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign --ip 0.0.0.0 --port 8000
 # Base model
 qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-Base --ip 0.0.0.0 --port 8000
 ```
+
+On Windows, you can also use `start_demo_windows.bat`. It uses the project-local `./py312` environment, prefers the local `./models/Qwen3-TTS-12Hz-1.7B-Base` checkpoint if present, asks whether to enable FlashAttention, and defaults to `http://127.0.0.1:7860`.
 
 And then open `http://<your-ip>:8000`, or access it via port forwarding in tools like VS Code.
 

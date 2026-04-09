@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlparse
 
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
+DEFAULT_MODELS_DIR = ROOT_DIR / "models"
 
 
 def ensure_dir(path: Path) -> Path:
@@ -135,6 +135,62 @@ def wav_bytes_from_array(wav, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def normalize_demo_audio(wav, eps: float = 1e-12, clip: bool = True):
+    import numpy as np
+
+    x = np.asarray(wav)
+
+    if np.issubdtype(x.dtype, np.integer):
+        info = np.iinfo(x.dtype)
+        if info.min < 0:
+            y = x.astype(np.float32) / max(abs(info.min), info.max)
+        else:
+            mid = (info.max + 1) / 2.0
+            y = (x.astype(np.float32) - mid) / mid
+    elif np.issubdtype(x.dtype, np.floating):
+        y = x.astype(np.float32)
+        peak = np.max(np.abs(y)) if y.size else 0.0
+        if peak > 1.0 + 1e-6:
+            y = y / (peak + eps)
+    else:
+        raise TypeError(f"Unsupported dtype: {x.dtype}")
+
+    if clip:
+        y = np.clip(y, -1.0, 1.0)
+
+    if y.ndim > 1:
+        y = np.mean(y, axis=-1).astype(np.float32)
+
+    return y
+
+
+def load_demo_audio_input(audio: str):
+    import librosa
+    import soundfile as sf
+
+    if _is_url(audio):
+        with urllib.request.urlopen(audio) as response:
+            payload = response.read()
+        with io.BytesIO(payload) as file_obj:
+            wav, sample_rate = sf.read(file_obj, always_2d=False)
+        return normalize_demo_audio(wav), int(sample_rate)
+
+    audio_path = Path(audio)
+    if audio_path.exists():
+        try:
+            wav, sample_rate = sf.read(audio_path, always_2d=False)
+        except Exception:
+            wav, sample_rate = librosa.load(str(audio_path), sr=None, mono=False)
+        return normalize_demo_audio(wav), int(sample_rate)
+
+    if _is_probably_base64(audio):
+        with io.BytesIO(_decode_base64_bytes(audio)) as file_obj:
+            wav, sample_rate = sf.read(file_obj, always_2d=False)
+        return normalize_demo_audio(wav), int(sample_rate)
+
+    raise ValueError(f"Unsupported audio input: {audio[:80]}")
+
+
 def get_training_audio_dir_value(payload: Dict[str, Any]) -> Optional[str]:
     for key in ("training-audio-dir", "trainingAudioDir", "training_audio_dir"):
         value = payload.get(key)
@@ -153,3 +209,9 @@ def resolve_training_audio_dir(default_dir: Path, payload: Dict[str, Any]) -> tu
     if dataset_dir.exists() and not dataset_dir.is_dir():
         raise ValueError(f"`training-audio-dir` is not a directory: {dataset_dir}")
     return ensure_dir(dataset_dir), True
+
+
+def resolve_model_ref(model_id: str, models_dir: Path) -> str:
+    from qwen_tts.path_utils import resolve_pretrained_model_ref
+
+    return resolve_pretrained_model_ref(model_id, models_dir=models_dir)

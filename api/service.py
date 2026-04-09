@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,7 +11,16 @@ from typing import Any, Dict, Optional
 
 from fastapi.responses import FileResponse, JSONResponse, Response
 
-from api.common import ensure_dir, make_id, normalize_file_route, resolve_relative_url, tail_text, wav_bytes_from_array, write_json
+from api.common import (
+    ensure_dir,
+    load_demo_audio_input,
+    make_id,
+    normalize_file_route,
+    resolve_relative_url,
+    tail_text,
+    wav_bytes_from_array,
+    write_json,
+)
 from api.runtime import (
     AppState,
     QueueFullError,
@@ -34,6 +44,20 @@ class ApiService:
     def __init__(self, state: AppState):
         self.state = state
 
+    @staticmethod
+    def _extract_generation_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
+        keys = (
+            "max_new_tokens",
+            "temperature",
+            "top_k",
+            "top_p",
+            "repetition_penalty",
+            "subtalker_top_k",
+            "subtalker_top_p",
+            "subtalker_temperature",
+        )
+        return {key: payload[key] for key in keys if payload.get(key) is not None}
+
     def build_audio_response(self, result: AudioResult) -> Response:
         audio_bytes = wav_bytes_from_array(result.wav, result.sample_rate)
         if result.response_format == "wav":
@@ -54,8 +78,11 @@ class ApiService:
             "selectedDevice": self.state.config.device,
             "deviceMode": self.state.config.device_mode,
             "deviceName": self.state.config.device_name,
+            "workerPid": os.getpid(),
+            "configuredWorkers": self.state.config.workers,
             "queueStatus": self.state.scheduler.snapshot(),
             "dataDir": str(self.state.config.data_dir.resolve()),
+            "modelsDir": str(self.state.config.models_dir.resolve()),
         }
 
     def get_voices(self) -> Dict[str, Any]:
@@ -119,15 +146,18 @@ class ApiService:
 
     def clone(self, payload: Dict[str, Any]) -> AudioResult:
         model_id = payload["modelId"]
+        ref_audio = load_demo_audio_input(payload["refAudio"])
+        generation_kwargs = self._extract_generation_kwargs(payload)
         wavs, sample_rate = self._run_gpu_job_sync(
             kind="clone",
             meta={"modelId": model_id},
             fn=lambda: self.state.models.get(model_id).generate_voice_clone(
-                text=payload["text"],
+                text=payload["text"].strip(),
                 language=payload.get("language", "Auto"),
-                ref_audio=payload["refAudio"],
-                ref_text=payload.get("refText"),
+                ref_audio=ref_audio,
+                ref_text=(payload.get("refText") or "").strip() or None,
                 x_vector_only_mode=bool(payload.get("xVectorOnlyMode", False)),
+                **generation_kwargs,
             ),
         )
         return AudioResult(
