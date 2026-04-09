@@ -12,6 +12,7 @@ from api.service import ApiService
 
 def create_app(state: AppState) -> FastAPI:
     app = FastAPI(title="Qwen3-TTS API", version="0.1.0")
+    api_prefix = "/api"
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -51,42 +52,42 @@ def create_app(state: AppState) -> FastAPI:
     async def generic_error(_: Request, exc: Exception):
         return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
-    @app.get("/healthz")
+    @app.get(f"{api_prefix}/healthz")
     def healthz():
         return service.healthz()
 
-    @app.get("/voices")
+    @app.get(f"{api_prefix}/voices")
     def voices():
         return service.get_voices()
 
-    @app.get("/trainVoice/{task_id}")
+    @app.get(f"{api_prefix}/trainVoice/{{task_id}}")
     def train_status(task_id: str):
         return service.get_train_status(task_id)
 
-    @app.get("/files/{file_path:path}")
+    @app.get(f"{api_prefix}/files/{{file_path:path}}")
     def files(file_path: str):
         return service.get_data_file_response(file_path)
 
-    @app.post("/voiceDesign")
+    @app.post(f"{api_prefix}/voiceDesign")
     def voice_design(request: VoiceDesignRequest):
         result = service.voice_design(request.model_dump(exclude_none=True))
         return service.build_audio_response(result)
 
-    @app.post("/clone")
+    @app.post(f"{api_prefix}/clone")
     def clone(request: CloneRequest):
         result = service.clone(request.model_dump(exclude_none=True))
         return service.build_audio_response(result)
 
-    @app.post("/customVoice")
+    @app.post(f"{api_prefix}/customVoice")
     def custom_voice(request: CustomVoiceRequest):
         result = service.custom_voice(request.model_dump(exclude_none=True))
         return service.build_audio_response(result)
 
-    @app.post("/trainVoice")
+    @app.post(f"{api_prefix}/trainVoice")
     def train_voice(request: TrainVoiceRequest):
         return service.train_voice(request.model_dump(exclude_none=True))
 
-    @app.post("/saveVoice")
+    @app.post(f"{api_prefix}/saveVoice")
     def save_voice(request: SaveVoiceRequest):
         return service.save_voice(request.model_dump(exclude_none=True))
 

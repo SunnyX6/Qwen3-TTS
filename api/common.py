@@ -60,7 +60,7 @@ def tail_text(path: Path, max_chars: int = 8000) -> str:
 
 def resolve_relative_url(path: Path, data_dir: Path) -> str:
     relative = path.resolve().relative_to(data_dir.resolve())
-    return "/files/" + "/".join(relative.parts)
+    return "/api/files/" + "/".join(relative.parts)
 
 
 def normalize_file_route(relative_path: str) -> str:

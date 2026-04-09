@@ -54,7 +54,7 @@ def main() -> int:
     print(f"Device name: {config.device_name}")
     print(f"Data dir: {config.data_dir}")
     print(f"Max GPU queue size: {config.max_gpu_queue_size}")
-    print(f"Qwen3-TTS API listening on http://{config.host}:{config.port}")
+    print(f"Qwen3-TTS API listening on http://{config.host}:{config.port}/api")
 
     uvicorn.run(app, host=config.host, port=config.port, workers=1)
     return 0

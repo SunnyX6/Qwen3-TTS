@@ -26,27 +26,27 @@
 
 `api/` 提供以下能力：
 
-- `POST /voiceDesign`
+- `POST /api/voiceDesign`
   - 调用 `Qwen3TTSModel.generate_voice_design(...)`
-- `POST /clone`
+- `POST /api/clone`
   - 调用 `Qwen3TTSModel.generate_voice_clone(...)`
-- `POST /customVoice`
+- `POST /api/customVoice`
   - 调用 `Qwen3TTSModel.generate_custom_voice(...)`
-- `POST /trainVoice`
+- `POST /api/trainVoice`
   - 基于用户上传的数据集执行单 speaker 微调
   - 训练结果先保存到草稿区
   - 训练完成后自动生成试听音频
-- `GET /trainVoice/{taskId}`
+- `GET /api/trainVoice/{taskId}`
   - 查询训练任务状态
   - 返回试听音频地址、草稿模型路径等
-- `POST /saveVoice`
+- `POST /api/saveVoice`
   - 将草稿音色保存到正式音色库
-- `GET /voices`
+- `GET /api/voices`
   - 列出正式音色库中的音色
-- `GET /healthz`
+- `GET /api/healthz`
   - 健康检查
   - 返回当前绑定设备和队列状态
-- `GET /files/...`
+- `GET /api/files/...`
   - 读取 `data/` 下的预览音频等静态文件
 
 ---
@@ -119,7 +119,7 @@ data/
 
 对外统一叫 `voice`，不暴露底层 `speaker` 命名。
 
-`/customVoice` 内部会映射为：
+`/api/customVoice` 内部会映射为：
 
 - `voice` -> `speaker`
 
@@ -163,10 +163,10 @@ data/
 - 服务内部只有 **1 个 GPU worker**
 - 所有 GPU 任务都必须串行执行
 - GPU 任务包括：
-  - `/voiceDesign`
-  - `/clone`
-  - `/customVoice`
-  - `/trainVoice`
+  - `/api/voiceDesign`
+  - `/api/clone`
+  - `/api/customVoice`
+  - `/api/trainVoice`
   - 训练完成后的自动试听
 - 业务上可以区分“训练请求”和“配音请求”
 - 但物理执行层永远只有一个 GPU 执行口
@@ -188,7 +188,7 @@ data/
 
 ## 4. 接口设计
 
-## 4.1 `POST /voiceDesign`
+## 4.1 `POST /api/voiceDesign`
 
 用于声音设计推理。
 
@@ -219,7 +219,7 @@ data/
 
 ---
 
-## 4.2 `POST /clone`
+## 4.2 `POST /api/clone`
 
 用于基于参考音频的克隆推理。
 
@@ -239,7 +239,7 @@ data/
 
 ---
 
-## 4.3 `POST /customVoice`
+## 4.3 `POST /api/customVoice`
 
 用于正式音色配音。
 
@@ -263,7 +263,7 @@ data/
 
 ---
 
-## 4.4 `POST /trainVoice`
+## 4.4 `POST /api/trainVoice`
 
 唯一训练接口。
 
@@ -329,7 +329,7 @@ data/
 
 ---
 
-## 4.5 `GET /trainVoice/{taskId}`
+## 4.5 `GET /api/trainVoice/{taskId}`
 
 查询训练状态。
 
@@ -347,8 +347,8 @@ data/
   "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
   "trainingAudioManagedExternally": true,
   "manifestPath": "/Users/demo/qwen-datasets/task-001/manifest.json",
-  "previewAudioUrl": "/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/preview/preview.wav",
-  "logUrl": "/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/training/train.log"
+  "previewAudioUrl": "/api/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/preview/preview.wav",
+  "logUrl": "/api/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/training/train.log"
 }
 ```
 
@@ -363,7 +363,7 @@ data/
 
 ---
 
-## 4.6 `POST /saveVoice`
+## 4.6 `POST /api/saveVoice`
 
 把草稿模型转成正式音色。
 
@@ -394,7 +394,7 @@ data/
   "voiceName": "客服女声A",
   "voice": "user_001_voice",
   "modelId": "data/voiceLibrary/voices/voice_20260402_xxxxxxxx/model",
-  "previewAudioUrl": "/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav",
+  "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav",
   "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
   "trainingAudioManagedExternally": true,
   "manifestPath": "/Users/demo/qwen-datasets/task-001/manifest.json"
@@ -403,7 +403,7 @@ data/
 
 ---
 
-## 4.7 `GET /voices`
+## 4.7 `GET /api/voices`
 
 列出正式音色库。
 
@@ -418,7 +418,7 @@ data/
       "voiceName": "客服女声A",
       "voice": "user_001_voice",
       "modelId": "data/voiceLibrary/voices/voice_20260402_xxxxxxxx/model",
-      "previewAudioUrl": "/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav",
+      "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav",
       "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
       "trainingAudioManagedExternally": true,
       "manifestPath": "/Users/demo/qwen-datasets/task-001/manifest.json"
@@ -580,7 +580,7 @@ Device mode: CUDA
 Selected device: cuda:0
 Device name: NVIDIA GeForce RTX 4090
 Data dir: /path/to/Qwen3-TTS/data
-API listening on http://0.0.0.0:8000
+API listening on http://0.0.0.0:8000/api
 ```
 
 如果当前走 MPS：
@@ -591,7 +591,7 @@ Device mode: MPS
 Selected device: mps
 Device name: Apple M2
 Data dir: /path/to/Qwen3-TTS/data
-API listening on http://0.0.0.0:8000
+API listening on http://0.0.0.0:8000/api
 ```
 
 如果既没有 CUDA 也没有 MPS：
@@ -606,7 +606,7 @@ Do you want to continue on CPU? [y/N]
 
 ### 6.3 服务状态接口建议
 
-`GET /healthz` 建议至少返回：
+`GET /api/healthz` 建议至少返回：
 
 ```json
 {
@@ -627,8 +627,8 @@ Do you want to continue on CPU? [y/N]
 ## 7. 前端推荐流程
 
 1. 用户上传多段音频并填写文本
-2. 调 `POST /trainVoice`
-3. 轮询 `GET /trainVoice/{taskId}`
+2. 调 `POST /api/trainVoice`
+3. 轮询 `GET /api/trainVoice/{taskId}`
 4. 状态变成 `preview_ready` 后播放 `previewAudioUrl`
-5. 用户满意则调 `POST /saveVoice`
-6. 后续用返回的 `modelId + voice` 调 `POST /customVoice`
+5. 用户满意则调 `POST /api/saveVoice`
+6. 后续用返回的 `modelId + voice` 调 `POST /api/customVoice`
