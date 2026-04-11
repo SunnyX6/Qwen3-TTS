@@ -31,6 +31,48 @@ from ..path_utils import resolve_pretrained_model_ref
 
 PYTORCH_INSTALL_URL = "https://pytorch.org/get-started/locally/"
 FLASH_ATTN_DOC_URL = "https://github.com/Dao-AILab/flash-attention"
+DEFAULT_GENERATION_MAX_NEW_TOKENS = 2048
+DEFAULT_GENERATION_TEMPERATURE = 0.9
+DEFAULT_GENERATION_TOP_P = 1.0
+DEFAULT_GENERATION_REPETITION_PENALTY = 1.05
+LEGACY_GENERATION_KWARGS = {
+    "do_sample",
+    "top_k",
+    "subtalker_dosample",
+    "subtalker_top_k",
+    "subtalker_top_p",
+    "subtalker_temperature",
+}
+
+LANGUAGE_ALIASES = {
+    "auto": {"auto", "自动"},
+    "chinese": {"chinese", "中文", "汉语", "普通话", "mandarin"},
+    "english": {"english", "英文", "英语"},
+    "japanese": {"japanese", "日语", "日文"},
+    "korean": {"korean", "韩语", "韩文"},
+    "german": {"german", "德语", "德文"},
+    "french": {"french", "法语", "法文"},
+    "russian": {"russian", "俄语", "俄文"},
+    "portuguese": {"portuguese", "葡萄牙语", "葡语"},
+    "spanish": {"spanish", "西班牙语", "西语"},
+    "italian": {"italian", "意大利语", "意语"},
+    "beijing_dialect": {
+        "beijing_dialect",
+        "beijing dialect",
+        "北京话",
+        "北京方言",
+        "北京腔",
+        "京片子",
+    },
+    "sichuan_dialect": {
+        "sichuan_dialect",
+        "sichuan dialect",
+        "四川话",
+        "四川方言",
+        "川话",
+        "成都话",
+    },
+}
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -71,10 +113,9 @@ class Qwen3TTSModel:
           model.get_supported_languages(), model.get_supported_speakers()
     """
 
-    def __init__(self, model: Qwen3TTSForConditionalGeneration, processor, generate_defaults: Optional[Dict[str, Any]] = None):
+    def __init__(self, model: Qwen3TTSForConditionalGeneration, processor):
         self.model = model
         self.processor = processor
-        self.generate_defaults = generate_defaults or {}
 
         self.device = getattr(model, "device", None)
         if self.device is None:
@@ -96,8 +137,6 @@ class Qwen3TTSModel:
           1) Loads config via AutoConfig (so your side can register model_type -> config/model).
           2) Loads the model via AutoModel.from_pretrained(...), forwarding `kwargs` unchanged.
           3) Loads the processor via AutoProcessor.from_pretrained(model_path).
-          4) Loads optional `generate_config.json` from the model directory/repo snapshot if present.
-
         Args:
             pretrained_model_name_or_path (str):
                 HuggingFace repo id or local directory of the model.
@@ -107,7 +146,7 @@ class Qwen3TTSModel:
 
         Returns:
             Qwen3TTSModel:
-                Wrapper instance containing `model`, `processor`, and generation defaults.
+                Wrapper instance containing `model` and `processor`.
         """
         models_dir = kwargs.pop("models_dir", None)
         resolved_model_ref = resolve_pretrained_model_ref(pretrained_model_name_or_path, models_dir=models_dir)
@@ -147,8 +186,7 @@ class Qwen3TTSModel:
 
         processor = AutoProcessor.from_pretrained(resolved_model_ref, fix_mistral_regex=True,)
 
-        generate_defaults = model.generate_config
-        return cls(model=model, processor=processor, generate_defaults=generate_defaults)
+        return cls(model=model, processor=processor)
 
     def _supported_languages_set(self) -> Optional[set]:
         langs = getattr(self.model, "get_supported_languages", None)
@@ -184,13 +222,25 @@ class Qwen3TTSModel:
 
         bad = []
         for lang in languages:
+            normalized_lang = self._normalize_language(lang)
             if lang is None:
                 bad.append(lang)
                 continue
-            if str(lang).lower() not in supported:
+            if str(normalized_lang).lower() not in supported:
                 bad.append(lang)
         if bad:
             raise ValueError(f"Unsupported languages: {bad}. Supported: {sorted(supported)}")
+
+    def _normalize_language(self, language: Optional[str]) -> Optional[str]:
+        if language is None:
+            return None
+        key = str(language).strip().lower()
+        if not key:
+            return language
+        for canonical, aliases in LANGUAGE_ALIASES.items():
+            if key == canonical or key in aliases:
+                return canonical
+        return language
 
     def _validate_speakers(self, speakers: List[Optional[str]]) -> None:
         """
@@ -316,68 +366,49 @@ class Qwen3TTSModel:
 
     def _merge_generate_kwargs(
         self,
-        do_sample: Optional[bool] = None,
-        top_k: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
         temperature: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
-        subtalker_dosample: Optional[bool] = None,
-        subtalker_top_k: Optional[int] = None,
-        subtalker_top_p: Optional[float] = None,
-        subtalker_temperature: Optional[float] = None,
-        max_new_tokens: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
-        Merge user-provided generation arguments with defaults from `generate_config.json`.
-
-        Rule:
-          - If the user explicitly passes a value (not None), use it.
-          - Otherwise, use the value from generate_config.json if present.
-          - Otherwise, fall back to the hard defaults.
+        Merge supported generation arguments with fixed defaults.
 
         Args:
-            do_sample, top_k, top_p, temperature, repetition_penalty,
-            subtalker_dosample, subtalker_top_k, subtalker_top_p, subtalker_temperature, max_new_tokens:
-                Common generation parameters.
+            max_new_tokens, top_p, temperature, repetition_penalty:
+                Supported advanced generation parameters.
             **kwargs:
                 Other arguments forwarded to model.generate().
 
         Returns:
             Dict[str, Any]: Final kwargs to pass into model.generate().
         """
-        hard_defaults = dict(
-            do_sample=True,
-            top_k=50,
-            top_p=1.0,
-            temperature=0.9,
-            repetition_penalty=1.05,
-            subtalker_dosample=True,
-            subtalker_top_k=50,
-            subtalker_top_p=1.0,
-            subtalker_temperature=0.9,
-            max_new_tokens=2048,
-        )
-
-        def pick(name: str, user_val: Any) -> Any:
-            if user_val is not None:
-                return user_val
-            if name in self.generate_defaults:
-                return self.generate_defaults[name]
-            return hard_defaults[name]
+        legacy_kwargs = sorted(key for key in kwargs if key in LEGACY_GENERATION_KWARGS)
+        if legacy_kwargs:
+            raise TypeError(
+                "Unsupported legacy generation kwargs: "
+                + ", ".join(legacy_kwargs)
+                + ". Only max_new_tokens, temperature, top_p, repetition_penalty are supported."
+            )
 
         merged = dict(kwargs)
         merged.update(
-            do_sample=pick("do_sample", do_sample),
-            top_k=pick("top_k", top_k),
-            top_p=pick("top_p", top_p),
-            temperature=pick("temperature", temperature),
-            repetition_penalty=pick("repetition_penalty", repetition_penalty),
-            subtalker_dosample=pick("subtalker_dosample", subtalker_dosample),
-            subtalker_top_k=pick("subtalker_top_k", subtalker_top_k),
-            subtalker_top_p=pick("subtalker_top_p", subtalker_top_p),
-            subtalker_temperature=pick("subtalker_temperature", subtalker_temperature),
-            max_new_tokens=pick("max_new_tokens", max_new_tokens),
+            do_sample=True,
+            max_new_tokens=(
+                DEFAULT_GENERATION_MAX_NEW_TOKENS
+                if max_new_tokens is None
+                else max_new_tokens
+            ),
+            temperature=(
+                DEFAULT_GENERATION_TEMPERATURE if temperature is None else temperature
+            ),
+            top_p=DEFAULT_GENERATION_TOP_P if top_p is None else top_p,
+            repetition_penalty=(
+                DEFAULT_GENERATION_REPETITION_PENALTY
+                if repetition_penalty is None
+                else repetition_penalty
+            ),
         )
         return merged
 
@@ -543,29 +574,18 @@ class Qwen3TTSModel:
             non_streaming_mode:
                 Using non-streaming text input, this option currently only simulates streaming text input when set to `false`, 
                 rather than enabling true streaming input or streaming generation.
-            do_sample:
-                Whether to use sampling, recommended to be set to `true` for most use cases.
-            top_k:
-                Top-k sampling parameter.
             top_p:
                 Top-p sampling parameter.
             temperature:
                 Sampling temperature; higher => more random.
             repetition_penalty:
                 Penalty to reduce repeated tokens/codes.
-            subtalker_dosample:
-                Sampling switch for the sub-talker (only valid for qwen3-tts-tokenizer-v2) if applicable.
-            subtalker_top_k:
-                Top-k for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
-            subtalker_top_p:
-                Top-p for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
-            subtalker_temperature:
-                Temperature for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
             max_new_tokens:
                 Maximum number of new codec tokens to generate.
             **kwargs:
-                Any other keyword arguments supported by HuggingFace Transformers `generate()` can be passed.
-                They will be forwarded to the underlying `Qwen3TTSForConditionalGeneration.generate(...)`.
+                Additional keyword arguments forwarded to the underlying
+                `Qwen3TTSForConditionalGeneration.generate(...)`.
+                Legacy sampling kwargs such as `top_k` and `subtalker_*` are rejected.
 
         Returns:
             Tuple[List[np.ndarray], int]:
@@ -589,6 +609,7 @@ class Qwen3TTSModel:
             languages = languages * len(texts)
         if len(texts) != len(languages):
             raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}")
+        languages = [self._normalize_language(lang) for lang in languages]
 
         self._validate_languages(languages)
 
@@ -685,29 +706,18 @@ class Qwen3TTSModel:
             non_streaming_mode:
                 Using non-streaming text input, this option currently only simulates streaming text input when set to `false`, 
                 rather than enabling true streaming input or streaming generation.
-            do_sample:
-                Whether to use sampling, recommended to be set to `true` for most use cases.
-            top_k:
-                Top-k sampling parameter.
             top_p:
                 Top-p sampling parameter.
             temperature:
                 Sampling temperature; higher => more random.
             repetition_penalty:
                 Penalty to reduce repeated tokens/codes.
-            subtalker_dosample:
-                Sampling switch for the sub-talker (only valid for qwen3-tts-tokenizer-v2) if applicable.
-            subtalker_top_k:
-                Top-k for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
-            subtalker_top_p:
-                Top-p for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
-            subtalker_temperature:
-                Temperature for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
             max_new_tokens:
                 Maximum number of new codec tokens to generate.
             **kwargs:
-                Any other keyword arguments supported by HuggingFace Transformers `generate()` can be passed.
-                They will be forwarded to the underlying `Qwen3TTSForConditionalGeneration.generate(...)`.
+                Additional keyword arguments forwarded to the underlying
+                `Qwen3TTSForConditionalGeneration.generate(...)`.
+                Legacy sampling kwargs such as `top_k` and `subtalker_*` are rejected.
 
         Returns:
             Tuple[List[np.ndarray], int]:
@@ -732,6 +742,7 @@ class Qwen3TTSModel:
 
         if not (len(texts) == len(languages) == len(instructs)):
             raise ValueError(f"Batch size mismatch: text={len(texts)}, language={len(languages)}, instruct={len(instructs)}")
+        languages = [self._normalize_language(lang) for lang in languages]
 
         self._validate_languages(languages)
 
@@ -783,29 +794,18 @@ class Qwen3TTSModel:
             non_streaming_mode:
                 Using non-streaming text input, this option currently only simulates streaming text input when set to `false`, 
                 rather than enabling true streaming input or streaming generation.
-            do_sample:
-                Whether to use sampling, recommended to be set to `true` for most use cases.
-            top_k:
-                Top-k sampling parameter.
             top_p:
                 Top-p sampling parameter.
             temperature:
                 Sampling temperature; higher => more random.
             repetition_penalty:
                 Penalty to reduce repeated tokens/codes.
-            subtalker_dosample:
-                Sampling switch for the sub-talker (only valid for qwen3-tts-tokenizer-v2) if applicable.
-            subtalker_top_k:
-                Top-k for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
-            subtalker_top_p:
-                Top-p for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
-            subtalker_temperature:
-                Temperature for sub-talker sampling (only valid for qwen3-tts-tokenizer-v2).
             max_new_tokens:
                 Maximum number of new codec tokens to generate.
             **kwargs:
-                Any other keyword arguments supported by HuggingFace Transformers `generate()` can be passed.
-                They will be forwarded to the underlying `Qwen3TTSForConditionalGeneration.generate(...)`.
+                Additional keyword arguments forwarded to the underlying
+                `Qwen3TTSForConditionalGeneration.generate(...)`.
+                Legacy sampling kwargs such as `top_k` and `subtalker_*` are rejected.
 
         Returns:
             Tuple[List[np.ndarray], int]:
@@ -841,6 +841,7 @@ class Qwen3TTSModel:
             raise ValueError(
                 f"Batch size mismatch: text={len(texts)}, language={len(languages)}, speaker={len(speakers)}, instruct={len(instructs)}"
             )
+        languages = [self._normalize_language(lang) for lang in languages]
 
         self._validate_languages(languages)
         self._validate_speakers(speakers)

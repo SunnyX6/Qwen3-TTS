@@ -59,6 +59,13 @@ def _maybe(v):
     return v if v is not None else gr.update()
 
 
+def _set_generation_seed(seed: int) -> None:
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qwen-tts-demo",
@@ -154,15 +161,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Optional generation args
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="Max new tokens for generation (optional).")
-    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (optional).")
-    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling (optional).")
-    parser.add_argument("--top-p", type=float, default=None, help="Top-p sampling (optional).")
-    parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty (optional).")
-    parser.add_argument("--subtalker-top-k", type=int, default=None, help="Subtalker top-k (optional, only for tokenizer v2).")
-    parser.add_argument("--subtalker-top-p", type=float, default=None, help="Subtalker top-p (optional, only for tokenizer v2).")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for generation (default: 0).")
     parser.add_argument(
-        "--subtalker-temperature", type=float, default=None, help="Subtalker temperature (optional, only for tokenizer v2)."
+        "--max-new-tokens",
+        type=int,
+        default=2048,
+        help="Max new tokens for generation (default: 2048).",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.9,
+        help="Sampling temperature (default: 0.9).",
+    )
+    parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling (default: 1.0).")
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.05,
+        help="Repetition penalty (default: 1.05).",
     )
 
     return parser
@@ -177,14 +194,11 @@ def _resolve_checkpoint(args: argparse.Namespace) -> str:
 
 def _collect_gen_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     mapping = {
+        "seed": args.seed,
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
-        "top_k": args.top_k,
         "top_p": args.top_p,
         "repetition_penalty": args.repetition_penalty,
-        "subtalker_top_k": args.subtalker_top_k,
-        "subtalker_top_p": args.subtalker_top_p,
-        "subtalker_temperature": args.subtalker_temperature,
     }
     return {k: v for k, v in mapping.items() if v is not None}
 
@@ -266,7 +280,9 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
     spk_choices_disp, spk_map = _build_choices_and_map([x for x in (supported_spks_raw or [])])
 
     def _gen_common_kwargs() -> Dict[str, Any]:
-        return dict(gen_kwargs_default)
+        kwargs = dict(gen_kwargs_default)
+        _set_generation_seed(int(kwargs.pop("seed", 0)))
+        return kwargs
 
     theme = gr.themes.Soft(
         font=[gr.themes.GoogleFont("Source Sans Pro"), "Arial", "sans-serif"],

@@ -54,7 +54,6 @@ def _serialize_config(config: ServerConfig) -> str:
         "flash_attn": config.flash_attn,
         "data_dir": str(config.data_dir),
         "models_dir": str(config.models_dir),
-        "workers": config.workers,
         "max_gpu_queue_size": config.max_gpu_queue_size,
     }
     return json.dumps(payload)
@@ -75,7 +74,6 @@ def _load_config_from_env() -> ServerConfig:
         flash_attn=bool(payload["flash_attn"]),
         data_dir=Path(payload["data_dir"]).resolve(),
         models_dir=Path(payload["models_dir"]).resolve(),
-        workers=int(payload["workers"]),
         max_gpu_queue_size=int(payload["max_gpu_queue_size"]),
     )
 
@@ -113,9 +111,6 @@ def main() -> int:
         return 1
     if not _validate_flash_attn(bool(args.flash_attn), device_mode):
         return 1
-    if int(args.workers) < 1:
-        print("`--workers` must be at least 1.", file=sys.stderr)
-        return 1
 
     config = ServerConfig(
         host=args.host,
@@ -127,7 +122,6 @@ def main() -> int:
         flash_attn=bool(args.flash_attn),
         data_dir=Path(args.data_dir).resolve(),
         models_dir=Path(args.models_dir).resolve(),
-        workers=int(args.workers),
         max_gpu_queue_size=int(args.max_gpu_queue_size),
     )
 
@@ -156,10 +150,7 @@ def main() -> int:
     print(f"Device name: {config.device_name}")
     print(f"Data dir: {config.data_dir}")
     print(f"Models dir: {config.models_dir}")
-    print(f"Workers: {config.workers}")
     print(f"Max GPU queue size: {config.max_gpu_queue_size}")
-    if config.workers > 1:
-        print("Note: each worker keeps its own model cache and GPU queue; GPU memory usage will increase.")
     print(f"Qwen3-TTS API listening on http://{config.host}:{config.port}/api")
 
     os.environ[SERVER_CONFIG_ENV] = _serialize_config(config)
@@ -167,7 +158,6 @@ def main() -> int:
         "api.main:create_uvicorn_app",
         host=config.host,
         port=config.port,
-        workers=config.workers,
         factory=True,
     )
     return 0

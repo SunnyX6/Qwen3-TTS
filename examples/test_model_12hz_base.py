@@ -77,15 +77,9 @@ def main():
 
     common_gen_kwargs = dict(
         max_new_tokens=2048,
-        do_sample=True,
-        top_k=50,
         top_p=1.0,
         temperature=0.9,
         repetition_penalty=1.05,
-        subtalker_dosample=True,
-        subtalker_top_k=50,
-        subtalker_top_p=1.0,
-        subtalker_temperature=0.9,
     )
 
     for xvec_only in [False, True]:

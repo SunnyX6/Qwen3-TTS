@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.runtime import AppState, QueueFullError
-from api.schemas import CloneRequest, CustomVoiceRequest, SaveVoiceRequest, TrainVoiceRequest, VoiceDesignRequest
+from api.schemas import CloneRequest, CustomVoiceRequest, DeployVoiceRequest, TrainVoiceRequest, VoiceDesignRequest
 from api.service import ApiService
 
 
@@ -74,8 +74,8 @@ def create_app(state: AppState) -> FastAPI:
         return service.build_audio_response(result)
 
     @app.post(f"{api_prefix}/clone")
-    def clone(request: CloneRequest):
-        result = service.clone(request.model_dump(exclude_none=True))
+    async def clone(request: CloneRequest = Depends(CloneRequest.as_form)):
+        result = service.clone(await request.to_payload())
         return service.build_audio_response(result)
 
     @app.post(f"{api_prefix}/customVoice")
@@ -84,11 +84,11 @@ def create_app(state: AppState) -> FastAPI:
         return service.build_audio_response(result)
 
     @app.post(f"{api_prefix}/trainVoice")
-    def train_voice(request: TrainVoiceRequest):
-        return service.train_voice(request.model_dump(exclude_none=True))
+    async def train_voice(request: TrainVoiceRequest = Depends(TrainVoiceRequest.as_form)):
+        return service.train_voice(await request.to_payload())
 
-    @app.post(f"{api_prefix}/saveVoice")
-    def save_voice(request: SaveVoiceRequest):
-        return service.save_voice(request.model_dump(exclude_none=True))
+    @app.post(f"{api_prefix}/deployVoice")
+    def deploy_voice(request: DeployVoiceRequest):
+        return service.deploy_voice(request.model_dump(exclude_none=True))
 
     return app

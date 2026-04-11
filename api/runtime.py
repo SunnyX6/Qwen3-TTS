@@ -6,6 +6,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,15 +15,19 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from api.common import (
+    DEFAULT_GENERATION_MAX_NEW_TOKENS,
+    DEFAULT_GENERATION_REPETITION_PENALTY,
+    DEFAULT_GENERATION_SEED,
+    DEFAULT_GENERATION_TEMPERATURE,
+    DEFAULT_GENERATION_TOP_P,
     ROOT_DIR,
     append_log,
     ensure_dir,
-    guess_audio_extension,
-    materialize_audio_input,
+    guess_audio_extension_from_filename,
+    materialize_uploaded_audio,
     read_json,
     resolve_model_ref,
-    resolve_relative_url,
-    resolve_training_audio_dir,
+    set_generation_seed,
     write_json,
 )
 from api.config import ServerConfig
@@ -188,8 +193,6 @@ class AppState:
         self.tasks = TrainTaskStore()
         self.scheduler = GpuJobScheduler(config.max_gpu_queue_size)
         ensure_dir(config.data_dir)
-        ensure_dir(config.data_dir / "voiceLibrary" / "drafts")
-        ensure_dir(config.data_dir / "voiceLibrary" / "voices")
         ensure_dir(config.models_dir)
 
     def draft_dir(self, task_id: str) -> Path:
@@ -256,50 +259,63 @@ def generate_preview(
     language: str,
     instruct: Optional[str],
     output_path: Path,
+    seed: Optional[int] = None,
+    max_new_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    repetition_penalty: Optional[float] = None,
 ) -> tuple[Path, int]:
     import soundfile as sf
 
+    set_generation_seed(seed if seed is not None else DEFAULT_GENERATION_SEED)
     model = model_manager.get(model_id)
+    generation_kwargs = {
+        "max_new_tokens": int(
+            DEFAULT_GENERATION_MAX_NEW_TOKENS
+            if max_new_tokens is None
+            else max_new_tokens
+        ),
+        "temperature": float(
+            DEFAULT_GENERATION_TEMPERATURE if temperature is None else temperature
+        ),
+        "top_p": float(DEFAULT_GENERATION_TOP_P if top_p is None else top_p),
+        "repetition_penalty": float(
+            DEFAULT_GENERATION_REPETITION_PENALTY
+            if repetition_penalty is None
+            else repetition_penalty
+        ),
+    }
     wavs, sample_rate = model.generate_custom_voice(
         text=text,
         language=language or "Auto",
         speaker=voice,
         instruct=instruct or None,
+        **generation_kwargs,
     )
     ensure_dir(output_path.parent)
     sf.write(str(output_path), wavs[0], sample_rate)
     return output_path, sample_rate
 
 
-def prepare_dataset_files(dataset_dir: Path, payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], Path, Path]:
-    dataset_dir = ensure_dir(dataset_dir)
-    manifest_path = dataset_dir / "manifest.json"
-    ref_input = payload["refAudio"]
-    ref_ext = guess_audio_extension(ref_input) if isinstance(ref_input, str) else ".wav"
+def prepare_training_audio_files(temp_dir: Path, payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], Path]:
+    dataset_dir = ensure_dir(temp_dir)
+    ref_ext = guess_audio_extension_from_filename(payload.get("refAudioFilename"))
     ref_path = dataset_dir / f"ref{ref_ext}"
-    materialize_audio_input(ref_input, ref_path)
+    materialize_uploaded_audio(payload["refAudioBytes"], ref_path)
 
     samples_out: List[Dict[str, Any]] = []
     for index, sample in enumerate(payload["samples"], start=1):
-        audio_input = sample["audio"]
-        extension = guess_audio_extension(audio_input) if isinstance(audio_input, str) else ".wav"
+        extension = guess_audio_extension_from_filename(sample.get("audioFilename"))
         sample_path = dataset_dir / f"sample_{index:04d}{extension}"
-        materialize_audio_input(audio_input, sample_path)
+        materialize_uploaded_audio(sample["audioBytes"], sample_path)
         samples_out.append(
             {
-                "audio": audio_input,
                 "text": sample["text"],
                 "localAudioPath": str(sample_path),
+                "uploadFilename": sample.get("audioFilename"),
             }
         )
-
-    manifest = {
-        "speakerName": payload["speakerName"],
-        "refAudio": str(ref_path),
-        "samples": [{"file": Path(item["localAudioPath"]).name, "text": item["text"]} for item in samples_out],
-    }
-    write_json(manifest_path, manifest)
-    return samples_out, ref_path, manifest_path
+    return samples_out, ref_path
 
 
 def update_task_meta(draft_dir: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -310,12 +326,36 @@ def update_task_meta(draft_dir: Path, updates: Dict[str, Any]) -> Dict[str, Any]
     return meta
 
 
+def prune_training_artifacts(training_dir: Path, preview_dir: Path) -> None:
+    keep_checkpoint = latest_checkpoint_dir(training_dir) if training_dir.exists() else None
+    keep_training_names = {"train.log"}
+    if keep_checkpoint is not None:
+        keep_training_names.add(keep_checkpoint.name)
+
+    if training_dir.exists():
+        for path in training_dir.iterdir():
+            if path.name in keep_training_names:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+    if preview_dir.exists():
+        for path in preview_dir.iterdir():
+            if path.name == "preview.wav":
+                continue
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+
 def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> None:
     draft_dir = state.draft_dir(task_id)
     training_dir = ensure_dir(draft_dir / "training")
     preview_dir = ensure_dir(draft_dir / "preview")
     log_path = training_dir / "train.log"
-    dataset_dir, dataset_external = resolve_training_audio_dir(draft_dir / "dataset", payload)
 
     try:
         resolved_model_id = resolve_model_ref(payload["modelId"], state.config.models_dir)
@@ -332,58 +372,58 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
                 "previewText": payload["previewText"],
                 "previewInstruct": payload.get("previewInstruct"),
                 "language": payload.get("language", "Auto"),
-                "trainingAudioDir": str(dataset_dir.resolve()),
-                "trainingAudioManagedExternally": dataset_external,
             },
         )
         state.tasks.set(task_id, running_meta)
 
-        samples_out, ref_audio_path, manifest_path = prepare_dataset_files(dataset_dir, payload)
-        raw_jsonl = training_dir / "train_raw.jsonl"
-        build_train_raw_jsonl(samples_out, ref_audio_path, raw_jsonl)
+        with tempfile.TemporaryDirectory(prefix=f"{task_id}_audio_") as tmp_dir:
+            temp_audio_dir = Path(tmp_dir)
+            samples_out, ref_audio_path = prepare_training_audio_files(temp_audio_dir, payload)
+            raw_jsonl = training_dir / "train_raw.jsonl"
+            build_train_raw_jsonl(samples_out, ref_audio_path, raw_jsonl)
 
-        coded_jsonl = training_dir / "train_with_codes.jsonl"
-        finetune_cwd = ROOT_DIR / "finetuning"
+            coded_jsonl = training_dir / "train_with_codes.jsonl"
+            finetune_cwd = ROOT_DIR / "finetuning"
 
-        run_command(
-            [
-                sys.executable,
-                "prepare_data.py",
-                "--device",
-                state.config.device,
-                "--tokenizer_model_path",
-                resolved_tokenizer_model_id,
-                "--input_jsonl",
-                str(raw_jsonl.resolve()),
-                "--output_jsonl",
-                str(coded_jsonl.resolve()),
-            ],
-            cwd=finetune_cwd,
-            log_path=log_path,
-        )
+            run_command(
+                [
+                    sys.executable,
+                    "prepare_data.py",
+                    "--device",
+                    state.config.device,
+                    "--tokenizer_model_path",
+                    resolved_tokenizer_model_id,
+                    "--input_jsonl",
+                    str(raw_jsonl.resolve()),
+                    "--output_jsonl",
+                    str(coded_jsonl.resolve()),
+                ],
+                cwd=finetune_cwd,
+                log_path=log_path,
+            )
 
-        run_command(
-            [
-                sys.executable,
-                "sft_12hz.py",
-                "--init_model_path",
-                resolved_model_id,
-                "--output_model_path",
-                str(training_dir.resolve()),
-                "--train_jsonl",
-                str(coded_jsonl.resolve()),
-                "--batch_size",
-                str(payload.get("batchSize", 8)),
-                "--lr",
-                str(payload.get("lr", 2e-6)),
-                "--num_epochs",
-                str(payload.get("numEpochs", 3)),
-                "--speaker_name",
-                payload["speakerName"],
-            ],
-            cwd=finetune_cwd,
-            log_path=log_path,
-        )
+            run_command(
+                [
+                    sys.executable,
+                    "sft_12hz.py",
+                    "--init_model_path",
+                    resolved_model_id,
+                    "--output_model_path",
+                    str(training_dir.resolve()),
+                    "--train_jsonl",
+                    str(coded_jsonl.resolve()),
+                    "--batch_size",
+                    str(payload.get("batchSize", 8)),
+                    "--lr",
+                    str(payload.get("lr", 2e-6)),
+                    "--num_epochs",
+                    str(payload.get("numEpochs", 3)),
+                    "--speaker_name",
+                    payload["speakerName"],
+                ],
+                cwd=finetune_cwd,
+                log_path=log_path,
+            )
 
         checkpoint_dir = latest_checkpoint_dir(training_dir)
         if checkpoint_dir is None:
@@ -398,13 +438,20 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
             language=payload.get("language", "Auto"),
             instruct=payload.get("previewInstruct"),
             output_path=preview_path,
+            seed=payload.get("seed", DEFAULT_GENERATION_SEED),
+            max_new_tokens=payload.get("max_new_tokens"),
+            temperature=payload.get("temperature", DEFAULT_GENERATION_TEMPERATURE),
+            top_p=payload.get("top_p", DEFAULT_GENERATION_TOP_P),
+            repetition_penalty=payload.get(
+                "repetition_penalty",
+                DEFAULT_GENERATION_REPETITION_PENALTY,
+            ),
         )
 
         ready_meta = update_task_meta(
             draft_dir,
             {
                 "status": "preview_ready",
-                "manifestPath": str(manifest_path.resolve()),
                 "draftModelId": str(checkpoint_dir.resolve()),
                 "previewAudioPath": str(preview_path.resolve()),
                 "logPath": str(log_path.resolve()),
@@ -425,6 +472,7 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
         )
         state.tasks.set(task_id, failed_meta)
     finally:
+        prune_training_artifacts(training_dir, preview_dir)
         state.models.clear()
 
 

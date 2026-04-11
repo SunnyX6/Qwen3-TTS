@@ -46,7 +46,11 @@ if exist "%ENV_DIR%\python.exe" (
   )
 
   if "!EXIT_CODE!"=="0" (
-    "%ENV_DIR%\python.exe" api\main.py !FLASH_ARGS! %*
+    if defined FLASH_ARGS (
+      "%ENV_DIR%\python.exe" api\main.py !FLASH_ARGS! %*
+    ) else (
+      "%ENV_DIR%\python.exe" api\main.py %*
+    )
     set "EXIT_CODE=!ERRORLEVEL!"
   )
 ) else (

@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-import base64
 import io
 import json
-import mimetypes
 import posixpath
-import re
-import shutil
-import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
-from urllib.parse import unquote, urlparse
+from typing import Any, Optional
+from urllib.parse import unquote
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
 DEFAULT_MODELS_DIR = ROOT_DIR / "models"
-
-
+DEFAULT_GENERATION_SEED = 0
+DEFAULT_GENERATION_MAX_NEW_TOKENS = 2048
+DEFAULT_GENERATION_TEMPERATURE = 0.9
+DEFAULT_GENERATION_TOP_P = 1.0
+DEFAULT_GENERATION_REPETITION_PENALTY = 1.05
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -67,64 +65,19 @@ def normalize_file_route(relative_path: str) -> str:
     return posixpath.normpath(unquote(relative_path)).lstrip("/")
 
 
-def _is_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value)
-    except Exception:
-        return False
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+def guess_audio_extension_from_filename(filename: Optional[str], default: str = ".wav") -> str:
+    suffix = Path(filename or "").suffix.lower().strip()
+    if suffix and suffix.startswith(".") and suffix[1:].isalnum():
+        return suffix
+    return default
 
 
-def _guess_ext_from_data_uri(value: str) -> str:
-    if not value.startswith("data:"):
-        return ".wav"
-    media = value.split(",", 1)[0]
-    mime = media[5:].split(";", 1)[0]
-    extension = mimetypes.guess_extension(mime) or ".wav"
-    if extension == ".jpe":
-        return ".jpg"
-    return extension
-
-
-def guess_audio_extension(value: str) -> str:
-    if value.startswith("data:audio"):
-        return _guess_ext_from_data_uri(value)
-    if _is_url(value):
-        suffix = Path(urlparse(value).path).suffix
-        return suffix or ".wav"
-    return Path(value).suffix or ".wav"
-
-
-def _is_probably_base64(value: str) -> bool:
-    if value.startswith("data:audio"):
-        return True
-    return ("/" not in value and "\\" not in value) and len(value) > 256
-
-
-def _decode_base64_bytes(value: str) -> bytes:
-    if value.startswith("data:") and "," in value:
-        value = value.split(",", 1)[1]
-    return base64.b64decode(value)
-
-
-def materialize_audio_input(audio: str, output_path: Path) -> Path:
+def materialize_uploaded_audio(audio_bytes: bytes, output_path: Path) -> Path:
+    if not audio_bytes:
+        raise ValueError("Uploaded audio file is empty")
     ensure_dir(output_path.parent)
-
-    if _is_url(audio):
-        with urllib.request.urlopen(audio) as response:
-            output_path.write_bytes(response.read())
-        return output_path
-
-    audio_path = Path(audio)
-    if audio_path.exists():
-        shutil.copy2(audio_path, output_path)
-        return output_path
-
-    if _is_probably_base64(audio):
-        output_path.write_bytes(_decode_base64_bytes(audio))
-        return output_path
-
-    raise ValueError(f"Unsupported audio input: {audio[:80]}")
+    output_path.write_bytes(audio_bytes)
+    return output_path
 
 
 def wav_bytes_from_array(wav, sample_rate: int) -> bytes:
@@ -133,6 +86,18 @@ def wav_bytes_from_array(wav, sample_rate: int) -> bytes:
     buffer = io.BytesIO()
     sf.write(buffer, wav, sample_rate, format="WAV")
     return buffer.getvalue()
+
+
+def set_generation_seed(seed: Optional[int]) -> int:
+    import numpy as np
+    import torch
+
+    resolved_seed = DEFAULT_GENERATION_SEED if seed is None else int(seed)
+    np.random.seed(resolved_seed % (2**32))
+    torch.manual_seed(resolved_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(resolved_seed)
+    return resolved_seed
 
 
 def normalize_demo_audio(wav, eps: float = 1e-12, clip: bool = True):
@@ -164,51 +129,20 @@ def normalize_demo_audio(wav, eps: float = 1e-12, clip: bool = True):
     return y
 
 
-def load_demo_audio_input(audio: str):
+def load_demo_audio_bytes(audio_bytes: bytes):
     import librosa
     import soundfile as sf
 
-    if _is_url(audio):
-        with urllib.request.urlopen(audio) as response:
-            payload = response.read()
-        with io.BytesIO(payload) as file_obj:
-            wav, sample_rate = sf.read(file_obj, always_2d=False)
-        return normalize_demo_audio(wav), int(sample_rate)
+    if not audio_bytes:
+        raise ValueError("Uploaded audio file is empty")
 
-    audio_path = Path(audio)
-    if audio_path.exists():
+    with io.BytesIO(audio_bytes) as file_obj:
         try:
-            wav, sample_rate = sf.read(audio_path, always_2d=False)
-        except Exception:
-            wav, sample_rate = librosa.load(str(audio_path), sr=None, mono=False)
-        return normalize_demo_audio(wav), int(sample_rate)
-
-    if _is_probably_base64(audio):
-        with io.BytesIO(_decode_base64_bytes(audio)) as file_obj:
             wav, sample_rate = sf.read(file_obj, always_2d=False)
-        return normalize_demo_audio(wav), int(sample_rate)
-
-    raise ValueError(f"Unsupported audio input: {audio[:80]}")
-
-
-def get_training_audio_dir_value(payload: Dict[str, Any]) -> Optional[str]:
-    for key in ("training-audio-dir", "trainingAudioDir", "training_audio_dir"):
-        value = payload.get(key)
-        if value is not None:
-            value = str(value).strip()
-            return value or None
-    return None
-
-
-def resolve_training_audio_dir(default_dir: Path, payload: Dict[str, Any]) -> tuple[Path, bool]:
-    requested = get_training_audio_dir_value(payload)
-    if not requested:
-        return ensure_dir(default_dir), False
-
-    dataset_dir = Path(requested).expanduser().resolve()
-    if dataset_dir.exists() and not dataset_dir.is_dir():
-        raise ValueError(f"`training-audio-dir` is not a directory: {dataset_dir}")
-    return ensure_dir(dataset_dir), True
+        except Exception:
+            file_obj.seek(0)
+            wav, sample_rate = librosa.load(file_obj, sr=None, mono=False)
+    return normalize_demo_audio(wav), int(sample_rate)
 
 
 def resolve_model_ref(model_id: str, models_dir: Path) -> str:

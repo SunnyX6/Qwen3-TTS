@@ -140,7 +140,7 @@ pip install -e ".[runtime,api]"
 
 The included launcher scripts (`start_api_mac.sh` and `start_api_windows.bat`) only use the project-local Conda environment at `./py312`. If you want to start the API through those scripts, create `py312` in the repository root, install a matching PyTorch build first, and then install `.[runtime,api]`. The scripts now ask whether to enable FlashAttention: choose `Y` to use it (and they will show the install command if `flash_attn` is missing), or choose `N` to start with `--no-flash-attn`.
 
-The API now starts with `--workers 2` by default. This can improve GPU utilization under concurrent requests, but each worker keeps its own model cache and GPU queue, so GPU memory usage will increase accordingly. If VRAM is tight, start with `--workers 1`.
+The API now runs as a single process and uses the in-process GPU queue to absorb concurrent requests. `--max-gpu-queue-size` defaults to `2`, which means up to 2 waiting GPU jobs can be queued behind the active one.
 
 The 25Hz tokenizer path requires `torchaudio`, which is intentionally not installed by default. If you need 25Hz tokenizer models, install a matching PyTorch + torchaudio build from the official PyTorch selector before using them.
 
@@ -414,6 +414,8 @@ qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-Base --ip 0.0.0.0 --port 8000
 ```
 
 On Windows, you can also use `start_demo_windows.bat`. It uses the project-local `./py312` environment, prefers the local `./models/Qwen3-TTS-12Hz-1.7B-Base` checkpoint if present, asks whether to enable FlashAttention, and defaults to `http://127.0.0.1:7860`.
+
+On macOS, you can also use `./start_demo_mac.sh`. It uses the project-local `./py312`, local model preference, default `http://127.0.0.1:7860`, and auto-selects `mps`/`cpu` when `--device` is not provided. If CUDA is unavailable, it automatically starts with `--no-flash-attn`.
 
 And then open `http://<your-ip>:8000`, or access it via port forwarding in tools like VS Code.
 

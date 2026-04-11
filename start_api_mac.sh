@@ -72,4 +72,8 @@ else
   fi
 fi
 
-exec "${ENV_PYTHON}" api/main.py "${extra_args[@]}" "$@"
+if [[ "${#extra_args[@]}" -gt 0 ]]; then
+  exec "${ENV_PYTHON}" api/main.py "${extra_args[@]}" "$@"
+fi
+
+exec "${ENV_PYTHON}" api/main.py "$@"

@@ -15,7 +15,6 @@
 - 保留官方 3 类推理能力
 - 增加“单 speaker 训练草稿 -> 试听 -> 保存到音色库”的产品流程
 - 默认所有数据都放在项目根目录下的 `data/` 中
-- 允许调用方通过 `training-audio-dir` 为单次训练指定外部音频目录
 - 默认自动选择 1 张可用 GPU，并在整个服务生命周期内固定使用
 - 所有 GPU 任务串行执行，避免用户本机显存被并发请求打爆
 - 不自动降级到 CPU；若只能使用 CPU，必须在终端显式确认后才允许启动
@@ -39,7 +38,7 @@
 - `GET /api/trainVoice/{taskId}`
   - 查询训练任务状态
   - 返回试听音频地址、草稿模型路径等
-- `POST /api/saveVoice`
+- `POST /api/deployVoice`
   - 将草稿音色保存到正式音色库
 - `GET /api/voices`
   - 列出正式音色库中的音色
@@ -72,11 +71,8 @@ data/
     drafts/
       {taskId}/
         training/
-          train_raw.jsonl
-          train_with_codes.jsonl
           train.log
-          checkpoint-epoch-0/
-          checkpoint-epoch-1/
+          checkpoint-epoch-{latest}/
         preview/
           preview.wav
         meta.json
@@ -95,10 +91,8 @@ data/
 
 - `drafts/` 是草稿训练区
 - `voices/` 是正式音色库
-- 默认情况下，用户上传的数据集会落到草稿目录的 `dataset/` 下
-- 如果请求里传了 `training-audio-dir`，则训练音频和 `manifest.json` 改为落到该外部目录
-- 使用外部目录时，正式音色库只记录路径，不再重复拷贝整份训练音频
-- 官方训练产物目录名本来就叫 `checkpoint-epoch-*`
+- 训练完成后，草稿目录只保留 `train.log`、最新 `checkpoint-epoch-*` 和 `preview.wav`
+- `train_raw.jsonl`、`train_with_codes.jsonl` 等中间产物会在任务结束后清理
 
 ---
 
@@ -128,20 +122,46 @@ data/
 
 ### 3.3 音频字段
 
-训练和推理都支持以下音频输入形式：
+`/api/clone` 和 `/api/trainVoice` 的音频输入统一使用 `multipart/form-data` 上传文件。
 
-- 本地路径
-- HTTP/HTTPS URL
-- `data:audio/...;base64,...` 数据 URI
-- 原始 base64 字符串
+服务端不再接收音频字段的本地路径、URL、`data:audio` 或原始 base64 字符串。
 
-训练接口默认会把这些输入落到 `data/voiceLibrary/drafts/{taskId}/dataset/` 下。
+字段约定：
 
-如果请求里显式传入 `training-audio-dir`，则训练音频改为落到该目录下。
+- `/api/clone`：`refAudio`（单文件）
+- `/api/trainVoice`：`refAudio`（单文件）、`sampleAudios`（多文件）、`sampleTexts`（与 `sampleAudios` 一一对应）
+- `/api/clone` 继续保留 `refText`
 
-这个字段是**请求参数**，由外部调用方自行管理目录生命周期。
+训练接口会在服务端临时目录中使用这些上传音频，仅用于当前训练任务的数据准备阶段，不会持久化保存到 `data/` 目录。
 
-### 3.4 运行设备
+### 3.4 公共生成参数
+
+以下参数为公共生成参数：
+
+- `seed`
+- `maxNewTokens`
+- `temperature`
+- `topP`
+- `repetitionPenalty`
+
+适用范围：
+
+- `/api/voiceDesign`
+- `/api/clone`
+- `/api/customVoice`
+- `/api/trainVoice`
+
+默认值固定为：
+
+- `seed = 0`
+- `maxNewTokens = 2048`
+- `temperature = 0.9`
+- `topP = 1.0`
+- `repetitionPenalty = 1.05`
+
+其中 `/api/trainVoice` 里的这 5 个参数只用于训练完成后的自动试听生成，不参与训练本身。
+
+### 3.5 运行设备
 
 服务不在每个请求里接收 `device`。
 
@@ -159,7 +179,7 @@ data/
 
 ---
 
-## 3.5 队列与资源策略
+## 3.6 队列与资源策略
 
 为避免用户本机显存被并发请求打爆，API 服务采用以下策略：
 
@@ -203,7 +223,12 @@ data/
   "text": "欢迎来到我们的节目。",
   "language": "Chinese",
   "instruct": "成熟稳重的男声，语速适中",
-  "responseFormat": "base64"
+  "responseFormat": "base64",
+  "seed": 0,
+  "maxNewTokens": 2048,
+  "temperature": 0.9,
+  "topP": 1.0,
+  "repetitionPenalty": 1.05
 }
 ```
 
@@ -226,33 +251,30 @@ data/
 
 用于基于参考音频的克隆推理。
 
-请求：
+请求类型：`multipart/form-data`
 
-```json
-{
-  "modelId": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-  "text": "欢迎来到我们的节目。",
-  "language": "Chinese",
-  "refAudio": "data:audio/wav;base64,...",
-  "refText": "欢迎来到我们的节目。",
-  "xVectorOnlyMode": false,
-  "responseFormat": "base64",
-  "maxNewTokens": 8192,
-  "temperature": 0.9,
-  "topK": 50,
-  "topP": 1.0,
-  "repetitionPenalty": 1.05,
-  "subtalkerTopK": 50,
-  "subtalkerTopP": 1.0,
-  "subtalkerTemperature": 0.9
-}
+```bash
+curl -X POST "http://127.0.0.1:8000/api/clone" \
+  -F "modelId=Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
+  -F "text=欢迎来到我们的节目。" \
+  -F "language=Chinese" \
+  -F "refAudio=@/path/to/ref.wav" \
+  -F "refText=欢迎来到我们的节目。" \
+  -F "xVectorOnlyMode=false" \
+  -F "responseFormat=base64" \
+  -F "seed=0" \
+  -F "maxNewTokens=2048" \
+  -F "temperature=0.9" \
+  -F "topP=1.0" \
+  -F "repetitionPenalty=1.05"
 ```
 
 说明：
 
 - `xVectorOnlyMode = false` 时，必须传 `refText`
-- `refAudio` 现在会按 `demo.py` 的方式先做归一化，再送进模型
-- `maxNewTokens`、`temperature`、`topK`、`topP`、`repetitionPenalty`、`subtalkerTopK`、`subtalkerTopP`、`subtalkerTemperature` 都可以直接通过 API 透传给底层生成逻辑
+- `refAudio` 必须是上传文件（`multipart` file part）
+- `refAudio` 会按 `demo.py` 的方式先做归一化，再送进模型
+- `seed`、`maxNewTokens`、`temperature`、`topP`、`repetitionPenalty` 都可以直接通过 API 透传给底层生成逻辑
 
 ---
 
@@ -269,7 +291,12 @@ data/
   "text": "欢迎来到我们的节目。",
   "language": "Chinese",
   "instruct": "更温柔一点",
-  "responseFormat": "base64"
+  "responseFormat": "base64",
+  "seed": 0,
+  "maxNewTokens": 2048,
+  "temperature": 0.9,
+  "topP": 1.0,
+  "repetitionPenalty": 1.05
 }
 ```
 
@@ -287,39 +314,38 @@ data/
 该接口做的事情：
 
 1. 创建草稿目录
-2. 保存用户上传的数据集
+2. 在系统临时目录中准备用户上传音频
 3. 生成 `train_raw.jsonl`
 4. 调用官方 `prepare_data.py`
 5. 调用官方 `sft_12hz.py`
 6. 找到最新 `checkpoint`
 7. 自动生成试听音频
+8. 清理中间产物，只保留 `train.log`、最新 `checkpoint` 和 `preview.wav`
 
 请求：
 
-```json
-{
-  "modelId": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-  "tokenizerModelId": "Qwen/Qwen3-TTS-Tokenizer-12Hz",
-  "speakerName": "user_001_voice",
-  "training-audio-dir": "/Users/demo/qwen-datasets/task-001",
-  "samples": [
-    {
-      "audio": "data:audio/wav;base64,...",
-      "text": "你好，欢迎使用。"
-    },
-    {
-      "audio": "data:audio/wav;base64,...",
-      "text": "今天下午三点开会。"
-    }
-  ],
-  "refAudio": "data:audio/wav;base64,...",
-  "previewText": "欢迎来到我们的节目。",
-  "previewInstruct": "温柔、自然、偏轻松",
-  "language": "Chinese",
-  "batchSize": 8,
-  "lr": 2e-6,
-  "numEpochs": 3
-}
+请求类型：`multipart/form-data`
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
+  -F "modelId=Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
+  -F "speakerName=user_001_voice" \
+  -F "previewText=欢迎来到我们的节目。" \
+  -F "previewInstruct=温柔、自然、偏轻松" \
+  -F "language=Chinese" \
+  -F "batchSize=8" \
+  -F "lr=2e-6" \
+  -F "numEpochs=3" \
+  -F "seed=0" \
+  -F "maxNewTokens=2048" \
+  -F "temperature=0.9" \
+  -F "topP=1.0" \
+  -F "repetitionPenalty=1.05" \
+  -F "refAudio=@/path/to/ref.wav" \
+  -F "sampleAudios=@/path/to/sample1.wav" \
+  -F "sampleTexts=你好，欢迎使用。" \
+  -F "sampleAudios=@/path/to/sample2.wav" \
+  -F "sampleTexts=今天下午三点开会。"
 ```
 
 响应：
@@ -329,20 +355,20 @@ data/
   "ok": true,
   "taskId": "train_20260402_xxxxxxxx",
   "status": "queued",
-  "queuePosition": 1,
-  "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
-  "trainingAudioManagedExternally": true
+  "queuePosition": 1
 }
 ```
 
 说明：
 
 - 这里的训练是单 speaker 微调
+- 服务端固定使用 `Qwen/Qwen3-TTS-Tokenizer-12Hz`，调用方不需要也不能再传 `tokenizerModelId`
 - `previewInstruct` 不参与训练，只用于训练完成后的试听
+- `seed`、`maxNewTokens`、`temperature`、`topP`、`repetitionPenalty` 在这个接口里只作用于训练完成后的自动试听生成
 - 当前训练数据仍然必须有文本
+- `sampleAudios` 和 `sampleTexts` 必须按顺序一一对应，数量必须一致
 - 训练使用服务启动时已经选定的设备，不在请求中单独传 `device`
-- 如果传了 `training-audio-dir`，服务会把 `refAudio`、`samples[*].audio` 和 `manifest.json` 落到该目录
-- 如果没传 `training-audio-dir`，则继续使用默认草稿目录下的 `dataset/`
+- 上传音频只在训练任务的数据准备阶段暂存于系统临时目录，不会持久化保存到 `data/`
 
 ---
 
@@ -361,9 +387,6 @@ data/
   "jobId": "trainVoice_20260402_xxxxxxxx",
   "queuePosition": 1,
   "draftModelId": "data/voiceLibrary/drafts/train_20260402_xxxxxxxx/training/checkpoint-epoch-2",
-  "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
-  "trainingAudioManagedExternally": true,
-  "manifestPath": "/Users/demo/qwen-datasets/task-001/manifest.json",
   "previewAudioUrl": "/api/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/preview/preview.wav",
   "logUrl": "/api/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/training/train.log"
 }
@@ -380,7 +403,7 @@ data/
 
 ---
 
-## 4.6 `POST /api/saveVoice`
+## 4.6 `POST /api/deployVoice`
 
 把草稿模型转成正式音色。
 
@@ -399,8 +422,6 @@ data/
 - 将最新 `checkpoint-epoch-*` 拷贝到正式目录的 `model/`
 - 生成新的 `voiceId`
 - 正式模型路径写入 `modelId`
-- 如果训练使用默认目录，则把草稿里的 `dataset/` 一起拷贝到正式目录
-- 如果训练使用 `training-audio-dir` 外部目录，则只在正式音色 `meta.json` 里记录该路径，不重复拷贝数据集
 
 返回：
 
@@ -411,10 +432,7 @@ data/
   "voiceName": "客服女声A",
   "voice": "user_001_voice",
   "modelId": "data/voiceLibrary/voices/voice_20260402_xxxxxxxx/model",
-  "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav",
-  "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
-  "trainingAudioManagedExternally": true,
-  "manifestPath": "/Users/demo/qwen-datasets/task-001/manifest.json"
+  "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav"
 }
 ```
 
@@ -435,10 +453,7 @@ data/
       "voiceName": "客服女声A",
       "voice": "user_001_voice",
       "modelId": "data/voiceLibrary/voices/voice_20260402_xxxxxxxx/model",
-      "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav",
-      "trainingAudioDir": "/Users/demo/qwen-datasets/task-001",
-      "trainingAudioManagedExternally": true,
-      "manifestPath": "/Users/demo/qwen-datasets/task-001/manifest.json"
+      "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav"
     }
   ]
 }
@@ -562,7 +577,6 @@ start_api_windows.bat --host 0.0.0.0 --port 8000
 - `--flash-attn`
 - `--data-dir`
 - `--models-dir`
-- `--workers`
 - `--max-gpu-queue-size`
 
 安装方式建议：
@@ -575,7 +589,7 @@ pip install -e ".[runtime,api]"
 
 > `--flash-attn` is enabled by default. If `flash_attn` is missing or broken, API startup now exits immediately with an installation hint instead of waiting until the first inference request fails.
 
-> `--workers` now defaults to `2`. This can improve throughput on capable GPUs, but each worker keeps its own model cache and its own GPU queue. If GPU memory is tight, lower it with `--workers 1`.
+> The API runs as a single process. `--max-gpu-queue-size` defaults to `2`, which means at most 2 waiting GPU jobs can queue behind the currently running job.
 
 ### 6.1 启动时设备选择
 
@@ -655,5 +669,5 @@ Do you want to continue on CPU? [y/N]
 2. 调 `POST /api/trainVoice`
 3. 轮询 `GET /api/trainVoice/{taskId}`
 4. 状态变成 `preview_ready` 后播放 `previewAudioUrl`
-5. 用户满意则调 `POST /api/saveVoice`
+5. 用户满意则调 `POST /api/deployVoice`
 6. 后续用返回的 `modelId + voice` 调 `POST /api/customVoice`

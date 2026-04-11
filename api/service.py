@@ -12,11 +12,18 @@ from typing import Any, Dict, Optional
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from api.common import (
+    DEFAULT_GENERATION_MAX_NEW_TOKENS,
+    DEFAULT_GENERATION_REPETITION_PENALTY,
+    DEFAULT_GENERATION_SEED,
+    DEFAULT_GENERATION_TEMPERATURE,
+    DEFAULT_GENERATION_TOP_P,
     ensure_dir,
-    load_demo_audio_input,
+    load_demo_audio_bytes,
     make_id,
     normalize_file_route,
+    read_json,
     resolve_relative_url,
+    set_generation_seed,
     tail_text,
     wav_bytes_from_array,
     write_json,
@@ -44,19 +51,55 @@ class ApiService:
     def __init__(self, state: AppState):
         self.state = state
 
+    def _extract_generation_kwargs(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        max_new_tokens = payload.get("max_new_tokens")
+        temperature = payload.get("temperature")
+        top_p = payload.get("top_p")
+        repetition_penalty = payload.get("repetition_penalty")
+        kwargs: Dict[str, Any] = {
+            "max_new_tokens": int(
+                DEFAULT_GENERATION_MAX_NEW_TOKENS
+                if max_new_tokens is None
+                else max_new_tokens
+            ),
+            "temperature": float(
+                DEFAULT_GENERATION_TEMPERATURE if temperature is None else temperature
+            ),
+            "top_p": float(DEFAULT_GENERATION_TOP_P if top_p is None else top_p),
+            "repetition_penalty": float(
+                DEFAULT_GENERATION_REPETITION_PENALTY
+                if repetition_penalty is None
+                else repetition_penalty
+            ),
+        }
+        return kwargs
+
     @staticmethod
-    def _extract_generation_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
-        keys = (
-            "max_new_tokens",
-            "temperature",
-            "top_k",
-            "top_p",
-            "repetition_penalty",
-            "subtalker_top_k",
-            "subtalker_top_p",
-            "subtalker_temperature",
+    def _resolve_generation_seed(payload: Dict[str, Any]) -> int:
+        seed = payload.get("seed")
+        return DEFAULT_GENERATION_SEED if seed is None else int(seed)
+
+    @staticmethod
+    def _post_process_audio(wav, sample_rate: int):
+        return wav
+
+    def _seeded_model_call(self, seed: int, fn):
+        set_generation_seed(seed)
+        return fn()
+
+    def _build_audio_result(
+        self,
+        wav,
+        sample_rate: int,
+        response_format: str,
+        extra: Dict[str, Any],
+    ) -> AudioResult:
+        return AudioResult(
+            wav=self._post_process_audio(wav, sample_rate),
+            sample_rate=sample_rate,
+            response_format=response_format,
+            extra=extra,
         )
-        return {key: payload[key] for key in keys if payload.get(key) is not None}
 
     def build_audio_response(self, result: AudioResult) -> Response:
         audio_bytes = wav_bytes_from_array(result.wav, result.sample_rate)
@@ -78,8 +121,7 @@ class ApiService:
             "selectedDevice": self.state.config.device,
             "deviceMode": self.state.config.device_mode,
             "deviceName": self.state.config.device_name,
-            "workerPid": os.getpid(),
-            "configuredWorkers": self.state.config.workers,
+            "processPid": os.getpid(),
             "queueStatus": self.state.scheduler.snapshot(),
             "dataDir": str(self.state.config.data_dir.resolve()),
             "modelsDir": str(self.state.config.models_dir.resolve()),
@@ -101,9 +143,6 @@ class ApiService:
             "jobId": meta.get("jobId"),
             "queuePosition": meta.get("queuePosition"),
             "draftModelId": meta.get("draftModelId"),
-            "trainingAudioDir": meta.get("trainingAudioDir"),
-            "trainingAudioManagedExternally": meta.get("trainingAudioManagedExternally"),
-            "manifestPath": meta.get("manifestPath"),
             "error": meta.get("error"),
         }
         preview_audio_path = meta.get("previewAudioPath")
@@ -128,16 +167,22 @@ class ApiService:
 
     def voice_design(self, payload: Dict[str, Any]) -> AudioResult:
         model_id = payload["modelId"]
+        generation_seed = self._resolve_generation_seed(payload)
+        generation_kwargs = self._extract_generation_kwargs(payload)
         wavs, sample_rate = self._run_gpu_job_sync(
             kind="voiceDesign",
-            meta={"modelId": model_id},
-            fn=lambda: self.state.models.get(model_id).generate_voice_design(
-                text=payload["text"],
-                language=payload.get("language", "Auto"),
-                instruct=payload["instruct"],
+            meta={"modelId": model_id, "seed": generation_seed},
+            fn=lambda: self._seeded_model_call(
+                generation_seed,
+                lambda: self.state.models.get(model_id).generate_voice_design(
+                    text=payload["text"],
+                    language=payload.get("language", "Auto"),
+                    instruct=payload["instruct"],
+                    **generation_kwargs,
+                ),
             ),
         )
-        return AudioResult(
+        return self._build_audio_result(
             wav=wavs[0],
             sample_rate=sample_rate,
             response_format=payload.get("responseFormat", "base64"),
@@ -146,21 +191,25 @@ class ApiService:
 
     def clone(self, payload: Dict[str, Any]) -> AudioResult:
         model_id = payload["modelId"]
-        ref_audio = load_demo_audio_input(payload["refAudio"])
+        ref_audio = load_demo_audio_bytes(payload["refAudioBytes"])
+        generation_seed = self._resolve_generation_seed(payload)
         generation_kwargs = self._extract_generation_kwargs(payload)
         wavs, sample_rate = self._run_gpu_job_sync(
             kind="clone",
-            meta={"modelId": model_id},
-            fn=lambda: self.state.models.get(model_id).generate_voice_clone(
-                text=payload["text"].strip(),
-                language=payload.get("language", "Auto"),
-                ref_audio=ref_audio,
-                ref_text=(payload.get("refText") or "").strip() or None,
-                x_vector_only_mode=bool(payload.get("xVectorOnlyMode", False)),
-                **generation_kwargs,
+            meta={"modelId": model_id, "seed": generation_seed},
+            fn=lambda: self._seeded_model_call(
+                generation_seed,
+                lambda: self.state.models.get(model_id).generate_voice_clone(
+                    text=payload["text"].strip(),
+                    language=payload.get("language", "Auto"),
+                    ref_audio=ref_audio,
+                    ref_text=(payload.get("refText") or "").strip() or None,
+                    x_vector_only_mode=bool(payload.get("xVectorOnlyMode", False)),
+                    **generation_kwargs,
+                ),
             ),
         )
-        return AudioResult(
+        return self._build_audio_result(
             wav=wavs[0],
             sample_rate=sample_rate,
             response_format=payload.get("responseFormat", "base64"),
@@ -170,24 +219,30 @@ class ApiService:
     def custom_voice(self, payload: Dict[str, Any]) -> AudioResult:
         model_id = payload["modelId"]
         requested_voice = payload.get("voice")
+        generation_seed = self._resolve_generation_seed(payload)
+        generation_kwargs = self._extract_generation_kwargs(payload)
 
         def _run_custom_voice():
-            model = self.state.models.get(model_id)
-            voice = self._resolve_custom_voice(model, requested_voice)
-            wavs, sample_rate = model.generate_custom_voice(
-                text=payload["text"],
-                language=payload.get("language", "Auto"),
-                speaker=voice,
-                instruct=payload.get("instruct"),
-            )
-            return wavs, sample_rate, voice
+            def _generate():
+                model = self.state.models.get(model_id)
+                voice = self._resolve_custom_voice(model, requested_voice)
+                wavs, sample_rate = model.generate_custom_voice(
+                    text=payload["text"],
+                    language=payload.get("language", "Auto"),
+                    speaker=voice,
+                    instruct=payload.get("instruct"),
+                    **generation_kwargs,
+                )
+                return wavs, sample_rate, voice
+
+            return self._seeded_model_call(generation_seed, _generate)
 
         wavs, sample_rate, voice = self._run_gpu_job_sync(
             kind="customVoice",
-            meta={"modelId": model_id, "voice": requested_voice},
+            meta={"modelId": model_id, "voice": requested_voice, "seed": generation_seed},
             fn=_run_custom_voice,
         )
-        return AudioResult(
+        return self._build_audio_result(
             wav=wavs[0],
             sample_rate=sample_rate,
             response_format=payload.get("responseFormat", "base64"),
@@ -195,23 +250,24 @@ class ApiService:
         )
 
     def train_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        required = ["modelId", "tokenizerModelId", "speakerName", "samples", "refAudio", "previewText"]
+        required = ["modelId", "tokenizerModelId", "speakerName", "samples", "refAudioBytes", "previewText"]
         for key in required:
             if key not in payload:
                 raise ValueError(f"Missing required field: {key}")
+        if not payload["refAudioBytes"]:
+            raise ValueError("`refAudio` file is empty")
         if not isinstance(payload["samples"], list) or not payload["samples"]:
             raise ValueError("`samples` must be a non-empty list")
         for sample in payload["samples"]:
-            if "audio" not in sample or "text" not in sample:
-                raise ValueError("Each sample must include `audio` and `text`")
+            if "audioBytes" not in sample or "text" not in sample:
+                raise ValueError("Each sample must include `audioBytes` and `text`")
+            if not sample["audioBytes"]:
+                raise ValueError("Sample audio file is empty")
 
         task_id = make_id("train")
         draft_dir = self.state.draft_dir(task_id)
         ensure_dir(draft_dir)
 
-        from api.common import resolve_training_audio_dir
-
-        training_audio_dir, training_audio_external = resolve_training_audio_dir(draft_dir / "dataset", payload)
         queued_meta = update_task_meta(
             draft_dir,
             {
@@ -219,8 +275,6 @@ class ApiService:
                 "status": "queued",
                 "speakerName": payload["speakerName"],
                 "modelId": payload["modelId"],
-                "trainingAudioDir": str(training_audio_dir.resolve()),
-                "trainingAudioManagedExternally": training_audio_external,
                 "createdAt": datetime.now().isoformat(),
             },
         )
@@ -258,23 +312,37 @@ class ApiService:
             "taskId": task_id,
             "status": "queued",
             "queuePosition": position,
-            "trainingAudioDir": str(training_audio_dir.resolve()),
-            "trainingAudioManagedExternally": training_audio_external,
         }
 
-    def save_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def deploy_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         task_id = payload["taskId"]
-        voice_name = payload.get("voiceName")
+        speaker_name = (payload.get("speakerName") or "").strip()
+        if not speaker_name:
+            raise ValueError("`speakerName` is required")
+
         meta = load_task_meta(self.state, task_id)
         if not meta:
             raise ValueError(f"Unknown taskId: {task_id}")
         if meta.get("status") != "preview_ready":
-            raise ValueError(f"Task {task_id} is not ready to save")
+            raise ValueError(f"Task {task_id} is not ready to deploy")
 
         draft_dir = self.state.draft_dir(task_id)
         draft_model_id = meta.get("draftModelId")
         if not draft_model_id:
             raise ValueError("Draft model path missing")
+
+        draft_model_path = Path(draft_model_id)
+        config_path = draft_model_path / "config.json"
+        config_dict = read_json(config_path, default=None)
+        if not isinstance(config_dict, dict):
+            raise ValueError("Draft model config missing or invalid")
+        talker_config = config_dict.get("talker_config")
+        if not isinstance(talker_config, dict):
+            talker_config = {}
+        talker_config["spk_id"] = {speaker_name: 3000}
+        talker_config["spk_is_dialect"] = {speaker_name: False}
+        config_dict["talker_config"] = talker_config
+        write_json(config_path, config_dict)
 
         voice_id = make_id("voice")
         voice_dir = self.state.voice_dir(voice_id)
@@ -283,31 +351,16 @@ class ApiService:
         preview_dst = voice_dir / "preview"
         model_dst = voice_dir / "model"
         shutil.copytree(draft_dir / "preview", preview_dst, dirs_exist_ok=True)
-        shutil.copytree(Path(draft_model_id), model_dst, dirs_exist_ok=True)
-
-        training_audio_dir = meta.get("trainingAudioDir")
-        training_audio_external = bool(meta.get("trainingAudioManagedExternally"))
-        manifest_path = meta.get("manifestPath")
-        if training_audio_external:
-            saved_training_audio_dir = training_audio_dir
-            saved_manifest_path = manifest_path
-        else:
-            dataset_dst = voice_dir / "dataset"
-            shutil.copytree(draft_dir / "dataset", dataset_dst, dirs_exist_ok=True)
-            saved_training_audio_dir = str(dataset_dst.resolve())
-            manifest_dst = dataset_dst / "manifest.json"
-            saved_manifest_path = str(manifest_dst.resolve()) if manifest_dst.exists() else manifest_path
+        shutil.copytree(draft_model_path, model_dst, dirs_exist_ok=True)
 
         saved_meta = {
             "voiceId": voice_id,
-            "voiceName": voice_name or meta.get("speakerName"),
-            "voice": meta.get("speakerName"),
+            "voiceName": speaker_name,
+            "voice": speaker_name,
+            "speakerName": speaker_name,
             "modelId": str(model_dst.resolve()),
             "previewAudioUrl": resolve_relative_url(preview_dst / "preview.wav", self.state.config.data_dir),
             "sourceTaskId": task_id,
-            "trainingAudioDir": saved_training_audio_dir,
-            "trainingAudioManagedExternally": training_audio_external,
-            "manifestPath": saved_manifest_path,
             "createdAt": datetime.now().isoformat(),
         }
         write_json(voice_dir / "meta.json", saved_meta)
@@ -318,6 +371,7 @@ class ApiService:
                 "status": "saved",
                 "savedVoiceId": voice_id,
                 "savedModelId": str(model_dst.resolve()),
+                "savedSpeakerName": speaker_name,
                 "updatedAt": datetime.now().isoformat(),
             },
         )
