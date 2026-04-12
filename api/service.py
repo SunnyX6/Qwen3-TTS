@@ -1,38 +1,45 @@
 from __future__ import annotations
 
+import asyncio
 import base64
-import mimetypes
+import json
 import os
-import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from api.asr import (
+    ASR_AUDIO_SAMPLE_RATE,
+    DEFAULT_ASR_MODEL_SIZE,
+    display_transcribe_language,
+    normalize_asr_model_size,
+    normalize_transcribe_language,
+    normalize_transcribe_provider,
+)
 from api.common import (
     DEFAULT_GENERATION_MAX_NEW_TOKENS,
     DEFAULT_GENERATION_REPETITION_PENALTY,
     DEFAULT_GENERATION_SEED,
     DEFAULT_GENERATION_TEMPERATURE,
     DEFAULT_GENERATION_TOP_P,
-    ensure_dir,
     load_demo_audio_bytes,
     make_id,
-    normalize_file_route,
     read_json,
-    resolve_relative_url,
     set_generation_seed,
-    tail_text,
     wav_bytes_from_array,
-    write_json,
 )
 from api.runtime import (
     AppState,
     QueueFullError,
-    list_voices,
+    get_builtin_speakers_for_base_model,
+    list_available_voices,
     load_task_meta,
+    resolve_public_base_model_id,
+    resolve_train_model_pair,
     run_train_task,
     update_task_meta,
 )
@@ -50,6 +57,26 @@ class AudioResult:
 class ApiService:
     def __init__(self, state: AppState):
         self.state = state
+
+    @staticmethod
+    def _resolve_requested_language(payload: Dict[str, Any]) -> str:
+        language = payload.get("language", "Auto")
+        language_value = str(language).strip()
+        return language_value or "Auto"
+
+    def _build_train_status_payload(self, task_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "taskId": task_id,
+            "status": meta.get("status"),
+            "speakerName": meta.get("speakerName"),
+            "voiceId": meta.get("voiceId"),
+            "voice": meta.get("voice"),
+            "baseModelId": meta.get("baseModelId") or meta.get("modelId"),
+            "jobId": meta.get("jobId"),
+            "queuePosition": meta.get("queuePosition"),
+            "error": meta.get("error"),
+        }
 
     def _extract_generation_kwargs(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         max_new_tokens = payload.get("max_new_tokens")
@@ -125,50 +152,177 @@ class ApiService:
             "queueStatus": self.state.scheduler.snapshot(),
             "dataDir": str(self.state.config.data_dir.resolve()),
             "modelsDir": str(self.state.config.models_dir.resolve()),
+            "asrModelsDir": str((self.state.config.models_dir / "asr").resolve()),
+            "customVoiceModelId": self.state.config.custom_voice_model_id,
         }
 
     def get_voices(self) -> Dict[str, Any]:
-        return {"ok": True, "voices": list_voices(self.state)}
+        return {"ok": True, "voices": list_available_voices(self.state)}
 
-    def get_train_status(self, task_id: str) -> Dict[str, Any]:
-        meta = load_task_meta(self.state, task_id)
-        if not meta:
+    def transcribe(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        audio_payloads = payload.get("audios")
+        if not isinstance(audio_payloads, list) or not audio_payloads:
+            raise ValueError("`audios` must be a non-empty list")
+
+        requested_language_code = normalize_transcribe_language(payload.get("language", "Auto"))
+        requested_language = display_transcribe_language(requested_language_code) or "Auto"
+        requested_provider = normalize_transcribe_provider(payload.get("provider", "auto"))
+        raw_model_size = str(payload.get("modelSize") or DEFAULT_ASR_MODEL_SIZE).strip()
+        requested_model_size = (
+            raw_model_size
+            if requested_provider == "funasr"
+            else normalize_asr_model_size(raw_model_size)
+        )
+        if requested_provider == "funasr" and requested_language_code not in {"zh", "yue"}:
+            raise ValueError("`provider=funasr` requires `language` to be Chinese or Cantonese")
+
+        def _run_batch() -> list[Dict[str, Any]]:
+            results: list[Dict[str, Any]] = []
+            for index, audio_payload in enumerate(audio_payloads):
+                filename = str(audio_payload.get("audioFilename") or f"audio_{index}.wav").strip()
+                try:
+                    audio_bytes = audio_payload.get("audioBytes")
+                    if not audio_bytes:
+                        raise ValueError("Uploaded audio file is empty")
+                    audio, _ = load_demo_audio_bytes(
+                        audio_bytes,
+                        target_sample_rate=ASR_AUDIO_SAMPLE_RATE,
+                    )
+                    transcribe_result = self.state.asr.transcribe(
+                        audio,
+                        language=requested_language_code,
+                        provider=requested_provider,
+                        model_size=requested_model_size,
+                    )
+                    results.append(
+                        {
+                            "index": index,
+                            "fileName": filename,
+                            "ok": True,
+                            "text": transcribe_result.get("text") or "",
+                            "languageDetected": transcribe_result.get("languageDetected"),
+                            "languageCode": transcribe_result.get("languageCode"),
+                            "providerUsed": transcribe_result.get("providerUsed"),
+                            "error": None,
+                        }
+                    )
+                except Exception as exc:
+                    results.append(
+                        {
+                            "index": index,
+                            "fileName": filename,
+                            "ok": False,
+                            "text": "",
+                            "languageDetected": None,
+                            "languageCode": None,
+                            "providerUsed": None,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            return results
+
+        results = self._run_gpu_job_sync(
+            kind="transcribe",
+            meta={
+                "provider": requested_provider,
+                "language": requested_language,
+                "audioCount": len(audio_payloads),
+            },
+            fn=_run_batch,
+        )
+        success_count = sum(1 for item in results if item.get("ok"))
+        failed_count = len(results) - success_count
+        return {
+            "ok": failed_count == 0,
+            "providerRequested": requested_provider,
+            "languageRequested": requested_language,
+            "modelSize": requested_model_size,
+            "total": len(results),
+            "successCount": success_count,
+            "failedCount": failed_count,
+            "results": results,
+        }
+
+    @staticmethod
+    def _is_terminal_train_status(status: Optional[str]) -> bool:
+        normalized = (status or "").strip().lower()
+        return normalized in {
+            "completed",
+            "failed",
+            "error",
+            "rejected",
+            "canceled",
+            "cancelled",
+        }
+
+    @staticmethod
+    def _encode_sse_payload(payload: Dict[str, Any], *, event: str, event_id: int) -> str:
+        raw_data = json.dumps(payload, ensure_ascii=False)
+        return f"id: {event_id}\nevent: {event}\ndata: {raw_data}\n\n"
+
+    def stream_train_status(self, task_id: str, request: Request) -> StreamingResponse:
+        initial_meta = load_task_meta(self.state, task_id)
+        if not initial_meta:
             raise FileNotFoundError(f"Unknown taskId: {task_id}")
 
-        result = {
-            "ok": True,
-            "taskId": task_id,
-            "status": meta.get("status"),
-            "speakerName": meta.get("speakerName"),
-            "jobId": meta.get("jobId"),
-            "queuePosition": meta.get("queuePosition"),
-            "draftModelId": meta.get("draftModelId"),
-            "error": meta.get("error"),
-        }
-        preview_audio_path = meta.get("previewAudioPath")
-        if preview_audio_path:
-            result["previewAudioUrl"] = resolve_relative_url(Path(preview_audio_path), self.state.config.data_dir)
-        log_path = meta.get("logPath")
-        if log_path:
-            result["logUrl"] = resolve_relative_url(Path(log_path), self.state.config.data_dir)
-            result["logTail"] = tail_text(Path(log_path))
-        return result
+        initial_snapshot = self.state.tasks.snapshot(task_id)
 
-    def get_data_file_response(self, relative_path: str) -> FileResponse:
-        clean_relative = normalize_file_route(relative_path)
-        file_path = (self.state.config.data_dir / clean_relative).resolve()
-        data_root = self.state.config.data_dir.resolve()
-        if not str(file_path).startswith(str(data_root)):
-            raise PermissionError("Forbidden path")
-        if not file_path.exists() or not file_path.is_file():
-            raise FileNotFoundError("File not found")
-        media_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-        return FileResponse(file_path, media_type=media_type)
+        async def event_stream():
+            if initial_snapshot is None:
+                initial_version = 0
+                initial_payload = self._build_train_status_payload(task_id, initial_meta)
+            else:
+                initial_version, snapshot_meta = initial_snapshot
+                initial_payload = self._build_train_status_payload(task_id, snapshot_meta)
+
+            yield self._encode_sse_payload(
+                initial_payload,
+                event="status",
+                event_id=initial_version,
+            )
+            if self._is_terminal_train_status(initial_payload.get("status")):
+                return
+
+            current_version = initial_version
+            while True:
+                if await request.is_disconnected():
+                    return
+
+                next_snapshot = await asyncio.to_thread(
+                    self.state.tasks.wait_for_update,
+                    task_id,
+                    current_version,
+                    15.0,
+                )
+                if next_snapshot is None:
+                    yield ": keep-alive\n\n"
+                    continue
+
+                current_version, next_meta = next_snapshot
+                next_payload = self._build_train_status_payload(task_id, next_meta)
+                yield self._encode_sse_payload(
+                    next_payload,
+                    event="status",
+                    event_id=current_version,
+                )
+                if self._is_terminal_train_status(next_payload.get("status")):
+                    return
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     def voice_design(self, payload: Dict[str, Any]) -> AudioResult:
         model_id = payload["modelId"]
         generation_seed = self._resolve_generation_seed(payload)
         generation_kwargs = self._extract_generation_kwargs(payload)
+        requested_language = self._resolve_requested_language(payload)
         wavs, sample_rate = self._run_gpu_job_sync(
             kind="voiceDesign",
             meta={"modelId": model_id, "seed": generation_seed},
@@ -176,7 +330,7 @@ class ApiService:
                 generation_seed,
                 lambda: self.state.models.get(model_id).generate_voice_design(
                     text=payload["text"],
-                    language=payload.get("language", "Auto"),
+                    language=requested_language,
                     instruct=payload["instruct"],
                     **generation_kwargs,
                 ),
@@ -194,6 +348,7 @@ class ApiService:
         ref_audio = load_demo_audio_bytes(payload["refAudioBytes"])
         generation_seed = self._resolve_generation_seed(payload)
         generation_kwargs = self._extract_generation_kwargs(payload)
+        requested_language = self._resolve_requested_language(payload)
         wavs, sample_rate = self._run_gpu_job_sync(
             kind="clone",
             meta={"modelId": model_id, "seed": generation_seed},
@@ -201,7 +356,7 @@ class ApiService:
                 generation_seed,
                 lambda: self.state.models.get(model_id).generate_voice_clone(
                     text=payload["text"].strip(),
-                    language=payload.get("language", "Auto"),
+                    language=requested_language,
                     ref_audio=ref_audio,
                     ref_text=(payload.get("refText") or "").strip() or None,
                     x_vector_only_mode=bool(payload.get("xVectorOnlyMode", False)),
@@ -217,18 +372,22 @@ class ApiService:
         )
 
     def custom_voice(self, payload: Dict[str, Any]) -> AudioResult:
-        model_id = payload["modelId"]
-        requested_voice = payload.get("voice")
+        requested_voice = (payload.get("voice") or "").strip()
+        if not requested_voice:
+            raise ValueError("`voice` is required")
         generation_seed = self._resolve_generation_seed(payload)
         generation_kwargs = self._extract_generation_kwargs(payload)
+        requested_language = self._resolve_requested_language(payload)
+        requested_dialect = payload.get("dialect")
 
         def _run_custom_voice():
             def _generate():
-                model = self.state.models.get(model_id)
+                model = self.state.models.get(self.state.config.custom_voice_model_id)
                 voice = self._resolve_custom_voice(model, requested_voice)
                 wavs, sample_rate = model.generate_custom_voice(
                     text=payload["text"],
-                    language=payload.get("language", "Auto"),
+                    language=requested_language,
+                    dialect=requested_dialect,
                     speaker=voice,
                     instruct=payload.get("instruct"),
                     **generation_kwargs,
@@ -239,18 +398,22 @@ class ApiService:
 
         wavs, sample_rate, voice = self._run_gpu_job_sync(
             kind="customVoice",
-            meta={"modelId": model_id, "voice": requested_voice, "seed": generation_seed},
+            meta={
+                "modelId": self.state.config.custom_voice_model_id,
+                "voice": requested_voice,
+                "seed": generation_seed,
+            },
             fn=_run_custom_voice,
         )
         return self._build_audio_result(
             wav=wavs[0],
             sample_rate=sample_rate,
             response_format=payload.get("responseFormat", "base64"),
-            extra={"modelId": model_id, "voice": voice},
+            extra={"modelId": self.state.config.custom_voice_model_id, "voice": voice},
         )
 
     def train_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        required = ["modelId", "tokenizerModelId", "speakerName", "samples", "refAudioBytes", "previewText"]
+        required = ["modelId", "tokenizerModelId", "speakerName", "samples", "refAudioBytes"]
         for key in required:
             if key not in payload:
                 raise ValueError(f"Missing required field: {key}")
@@ -264,17 +427,28 @@ class ApiService:
             if not sample["audioBytes"]:
                 raise ValueError("Sample audio file is empty")
 
-        task_id = make_id("train")
-        draft_dir = self.state.draft_dir(task_id)
-        ensure_dir(draft_dir)
+        _, resolved_runtime_model_id = resolve_train_model_pair(
+            payload["modelId"],
+            self.state.config.models_dir,
+            expected_runtime_model_id=self.state.config.custom_voice_model_id,
+        )
+        resolved_train_model_id = resolve_public_base_model_id(payload["modelId"], self.state.config.models_dir)
+        builtin_speakers = get_builtin_speakers_for_base_model(self.state, resolved_runtime_model_id)
+        self.state.voice_registry.assert_speaker_available(
+            payload["speakerName"],
+            base_model_id=resolved_runtime_model_id,
+            builtin_speakers=builtin_speakers,
+        )
 
+        task_id = make_id("train")
         queued_meta = update_task_meta(
-            draft_dir,
+            None,
             {
                 "taskId": task_id,
                 "status": "queued",
                 "speakerName": payload["speakerName"],
-                "modelId": payload["modelId"],
+                "baseModelId": resolved_train_model_id,
+                "modelId": resolved_runtime_model_id,
                 "createdAt": datetime.now().isoformat(),
             },
         )
@@ -288,7 +462,7 @@ class ApiService:
             )
         except QueueFullError:
             rejected = update_task_meta(
-                draft_dir,
+                self.state.tasks.get(task_id),
                 {
                     "status": "rejected",
                     "error": f"GPU queue is full (max={self.state.config.max_gpu_queue_size})",
@@ -299,7 +473,7 @@ class ApiService:
             raise
 
         updated = update_task_meta(
-            draft_dir,
+            self.state.tasks.get(task_id),
             {
                 "jobId": handle.job_id,
                 "queuePosition": position,
@@ -314,73 +488,36 @@ class ApiService:
             "queuePosition": position,
         }
 
-    def deploy_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        task_id = payload["taskId"]
-        speaker_name = (payload.get("speakerName") or "").strip()
-        if not speaker_name:
-            raise ValueError("`speakerName` is required")
-
-        meta = load_task_meta(self.state, task_id)
-        if not meta:
-            raise ValueError(f"Unknown taskId: {task_id}")
-        if meta.get("status") != "preview_ready":
-            raise ValueError(f"Task {task_id} is not ready to deploy")
-
-        draft_dir = self.state.draft_dir(task_id)
-        draft_model_id = meta.get("draftModelId")
-        if not draft_model_id:
-            raise ValueError("Draft model path missing")
-
-        draft_model_path = Path(draft_model_id)
-        config_path = draft_model_path / "config.json"
-        config_dict = read_json(config_path, default=None)
-        if not isinstance(config_dict, dict):
-            raise ValueError("Draft model config missing or invalid")
-        talker_config = config_dict.get("talker_config")
-        if not isinstance(talker_config, dict):
-            talker_config = {}
-        talker_config["spk_id"] = {speaker_name: 3000}
-        talker_config["spk_is_dialect"] = {speaker_name: False}
-        config_dict["talker_config"] = talker_config
-        write_json(config_path, config_dict)
-
-        voice_id = make_id("voice")
-        voice_dir = self.state.voice_dir(voice_id)
-        ensure_dir(voice_dir)
-
-        preview_dst = voice_dir / "preview"
-        model_dst = voice_dir / "model"
-        shutil.copytree(draft_dir / "preview", preview_dst, dirs_exist_ok=True)
-        shutil.copytree(draft_model_path, model_dst, dirs_exist_ok=True)
-
-        saved_meta = {
-            "voiceId": voice_id,
-            "voiceName": speaker_name,
-            "voice": speaker_name,
-            "speakerName": speaker_name,
-            "modelId": str(model_dst.resolve()),
-            "previewAudioUrl": resolve_relative_url(preview_dst / "preview.wav", self.state.config.data_dir),
-            "sourceTaskId": task_id,
-            "createdAt": datetime.now().isoformat(),
+    def delete_voice(self, voice_id: str) -> Dict[str, Any]:
+        existing = self.state.voice_registry.find_by_voice_id(voice_id)
+        if existing is None:
+            raise FileNotFoundError(f"Unknown voiceId: {voice_id}")
+        meta = read_json(Path(existing.path) / "meta.json", default={}) or {}
+        public_base_model_id = str(
+            meta.get("baseModelId") or resolve_public_base_model_id(existing.base_model_id, self.state.config.models_dir)
+        ).strip()
+        removed = self.state.voice_registry.delete(voice_id)
+        self.state.models.clear()
+        return {
+            "ok": True,
+            "voiceId": removed.voice_id,
+            "speaker": removed.speaker,
+            "baseModelId": public_base_model_id,
         }
-        write_json(voice_dir / "meta.json", saved_meta)
-
-        saved_task_meta = update_task_meta(
-            draft_dir,
-            {
-                "status": "saved",
-                "savedVoiceId": voice_id,
-                "savedModelId": str(model_dst.resolve()),
-                "savedSpeakerName": speaker_name,
-                "updatedAt": datetime.now().isoformat(),
-            },
-        )
-        self.state.tasks.set(task_id, saved_task_meta)
-        return {"ok": True, **saved_meta}
 
     def _run_gpu_job_sync(self, kind: str, fn, meta: Optional[Dict[str, Any]] = None) -> Any:
-        handle, _ = self.state.scheduler.submit(kind=kind, fn=fn, meta=meta)
+        def _wrapped():
+            self._prepare_gpu_job_models(kind)
+            return fn()
+
+        handle, _ = self.state.scheduler.submit(kind=kind, fn=_wrapped, meta=meta)
         return self.state.scheduler.wait(handle)
+
+    def _prepare_gpu_job_models(self, kind: str) -> None:
+        if kind == "transcribe":
+            self.state.models.clear()
+            return
+        self.state.asr.clear()
 
     @staticmethod
     def _resolve_custom_voice(model: Qwen3TTSModel, requested_voice: Optional[str]) -> str:

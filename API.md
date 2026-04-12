@@ -4,6 +4,11 @@
 
 说明：
 
+- 本文档描述当前 `api/` 实现
+- 若文档与代码存在冲突，以代码和 `CUSTOM_SPEAKER_BANK_ARCHITECTURE.md` 为准
+
+说明：
+
 - 具体职责代码拆分放在根目录 `api/` 下
 - 启动脚本直接运行 `api/main.py`
 - 不修改 `qwen_tts/` 下官方源码
@@ -11,9 +16,9 @@
 目标：
 
 - API 侧只新增 `FastAPI` / `uvicorn`
-- 不修改官方训练脚本
+- 训练与推理都由仓内模块统一编排
 - 保留官方 3 类推理能力
-- 增加“单 speaker 训练草稿 -> 试听 -> 保存到音色库”的产品流程
+- 增加“单 speaker 训练 -> 自动注册到音色库 -> 直接用于 customVoice”的产品流程
 - 默认所有数据都放在项目根目录下的 `data/` 中
 - 默认自动选择 1 张可用 GPU，并在整个服务生命周期内固定使用
 - 所有 GPU 任务串行执行，避免用户本机显存被并发请求打爆
@@ -33,20 +38,18 @@
   - 调用 `Qwen3TTSModel.generate_custom_voice(...)`
 - `POST /api/trainVoice`
   - 基于用户上传的数据集执行单 speaker 微调
-  - 训练结果先保存到草稿区
-  - 训练完成后自动生成试听音频
-- `GET /api/trainVoice/{taskId}`
-  - 查询训练任务状态
-  - 返回试听音频地址、草稿模型路径等
-- `POST /api/deployVoice`
-  - 将草稿音色保存到正式音色库
+  - 同一条 HTTP 连接以 `SSE` 持续返回训练状态
+  - 训练成功后自动注册到当前 `CustomVoice` backbone 的音色库
+- `POST /api/transcribe`
+  - 独立的便利转录接口
+  - 不参与训练流程，只负责语音转文本
 - `GET /api/voices`
-  - 列出正式音色库中的音色
+  - 列出当前 backbone 下可用的内置 speaker 和自定义 speaker
+- `DELETE /api/voices/{voiceId}`
+  - 删除一个已注册的自定义音色
 - `GET /api/healthz`
   - 健康检查
   - 返回当前绑定设备和队列状态
-- `GET /api/files/...`
-  - 读取 `data/` 下的预览音频等静态文件
 
 ---
 
@@ -57,6 +60,7 @@
 ```text
 api/
   app.py
+  asr.py
   common.py
   config.py
   device.py
@@ -66,33 +70,36 @@ api/
   service.py
 start_api_mac.sh
 start_api_windows.bat
+models/
+  asr/
+    faster-whisper/
+      large-v3/
+      large-v3-turbo/
+      ...
+    faster-whisper-cache/
+    funasr/
+      speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/
+      speech_fsmn_vad_zh-cn-16k-common-pytorch/
+      punc_ct-transformer_zh-cn-common-vocab272727-pytorch/
+      speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online/
 data/
-  voiceLibrary/
-    drafts/
-      {taskId}/
-        training/
-          train.log
-          checkpoint-epoch-{latest}/
-        preview/
-          preview.wav
-        meta.json
-    voices/
-      {voiceId}/
-        model/
-          config.json
-          model.safetensors
-          ...
-        preview/
-          preview.wav
-        meta.json
+  voices/
+    index.json
+    {voiceId}/
+      model/
+        speaker.safetensors
+        speaker_config.json
+      training_summary.json
+      meta.json
 ```
 
 说明：
 
-- `drafts/` 是草稿训练区
-- `voices/` 是正式音色库
-- 训练完成后，草稿目录只保留 `train.log`、最新 `checkpoint-epoch-*` 和 `preview.wav`
-- `train_raw.jsonl`、`train_with_codes.jsonl` 等中间产物会在任务结束后清理
+- `voices/` 是已注册的自定义音色库，`index.json` 是注册索引
+- 训练日志只输出到 API 服务终端，不落盘保存为 `train.log`
+- 训练过程使用项目内 `data/train/tmp/` 工作目录，训练完成后会自动清理子目录
+- `models/asr/` 是转录接口的推荐本地模型目录
+- 若启动时传了 `--models-dir /your/path/models`，则 ASR 目录会变成 `/your/path/models/asr`
 
 ---
 
@@ -108,7 +115,7 @@ data/
 - `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
 - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
 - `Qwen3-TTS-12Hz-1.7B-Base`
-- `data/voiceLibrary/voices/voice_xxx/model`
+- `data/voices/voice_xxx/model`
 
 > API and loaders now prefer the project-local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if it exists, and simple names like `Qwen3-TTS-12Hz-1.7B-Base` are treated as `./models/Qwen3-TTS-12Hz-1.7B-Base` by default.
 
@@ -122,7 +129,7 @@ data/
 
 ### 3.3 音频字段
 
-`/api/clone` 和 `/api/trainVoice` 的音频输入统一使用 `multipart/form-data` 上传文件。
+`/api/clone`、`/api/trainVoice` 和 `/api/transcribe` 的音频输入统一使用 `multipart/form-data` 上传文件。
 
 服务端不再接收音频字段的本地路径、URL、`data:audio` 或原始 base64 字符串。
 
@@ -130,6 +137,7 @@ data/
 
 - `/api/clone`：`refAudio`（单文件）
 - `/api/trainVoice`：`refAudio`（单文件）、`sampleAudios`（多文件）、`sampleTexts`（与 `sampleAudios` 一一对应）
+- `/api/transcribe`：`audios`（多文件）
 - `/api/clone` 继续保留 `refText`
 
 训练接口会在服务端临时目录中使用这些上传音频，仅用于当前训练任务的数据准备阶段，不会持久化保存到 `data/` 目录。
@@ -149,7 +157,6 @@ data/
 - `/api/voiceDesign`
 - `/api/clone`
 - `/api/customVoice`
-- `/api/trainVoice`
 
 默认值固定为：
 
@@ -158,8 +165,6 @@ data/
 - `temperature = 0.9`
 - `topP = 1.0`
 - `repetitionPenalty = 1.05`
-
-其中 `/api/trainVoice` 里的这 5 个参数只用于训练完成后的自动试听生成，不参与训练本身。
 
 ### 3.5 运行设备
 
@@ -170,7 +175,7 @@ data/
 - 服务启动时按 `CUDA > MPS > CPU确认` 的顺序选择设备
 - 默认自动选择 1 张 GPU
 - 整个服务生命周期内固定使用这 1 张 GPU
-- 所有训练、试听、配音都共用这张 GPU
+- 所有训练和推理都共用这张 GPU
 - 不做运行中切卡
 
 如果用户显式通过启动参数指定 `--device cuda:1`，则优先使用该设备。
@@ -186,11 +191,11 @@ data/
 - 服务内部只有 **1 个 GPU worker**
 - 所有 GPU 任务都必须串行执行
 - GPU 任务包括：
+  - `/api/transcribe`
   - `/api/voiceDesign`
   - `/api/clone`
   - `/api/customVoice`
   - `/api/trainVoice`
-  - 训练完成后的自动试听
 - 业务上可以区分“训练请求”和“配音请求”
 - 但物理执行层永远只有一个 GPU 执行口
 
@@ -211,7 +216,118 @@ data/
 
 ## 4. 接口设计
 
-## 4.1 `POST /api/voiceDesign`
+## 4.1 `POST /api/transcribe`
+
+独立的便利转录接口。
+
+请求类型：`multipart/form-data`
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/transcribe" \
+  -F "language=Auto" \
+  -F "provider=auto" \
+  -F "modelSize=large-v3" \
+  -F "audios=@/path/to/a.wav" \
+  -F "audios=@/path/to/b.wav"
+```
+
+请求字段：
+
+- `language`
+  - 可选值：`Auto`、`Chinese`、`Cantonese`、`English`、`Japanese`、`Korean`
+- `provider`
+  - 可选值：`auto`、`faster-whisper`、`funasr`
+  - 其中 `funasr` 只接受 `Chinese` 或 `Cantonese`
+- `modelSize`
+  - 当前用于 `faster-whisper`
+  - 可选值：`medium`、`medium.en`、`large-v2`、`large-v3`、`large-v3-turbo`
+- `audios`
+  - 一个或多个上传音频文件
+
+返回：
+
+```json
+{
+  "ok": true,
+  "providerRequested": "auto",
+  "languageRequested": "Auto",
+  "modelSize": "large-v3",
+  "total": 2,
+  "successCount": 2,
+  "failedCount": 0,
+  "results": [
+    {
+      "index": 0,
+      "fileName": "a.wav",
+      "ok": true,
+      "text": "额度耗尽，强制睡觉",
+      "languageDetected": "Chinese",
+      "languageCode": "zh",
+      "providerUsed": "funasr",
+      "error": null
+    },
+    {
+      "index": 1,
+      "fileName": "b.wav",
+      "ok": true,
+      "text": "今天下午三点开会。",
+      "languageDetected": "Chinese",
+      "languageCode": "zh",
+      "providerUsed": "funasr",
+      "error": null
+    }
+  ]
+}
+```
+
+说明：
+
+- 该接口和训练接口没有耦合，只是独立的便利转录能力
+- 服务端在内存中解码音频，并统一转换到 `16kHz`
+- `provider=auto` 时，会优先做自动判断；识别到 `zh` / `yue` 时转到 `FunASR`
+- 单个文件失败不会拖垮整批请求，错误会落在对应 `results[i].error`
+- 当前实现会优先读取项目内本地目录；若本地目录不存在，则按上游库默认方式自动下载
+
+本地模型目录约定：
+
+- `faster-whisper`
+  - `<models-dir>/asr/faster-whisper/<modelSize>`
+  - 例：`./models/asr/faster-whisper/large-v3`
+- `FunASR`
+  - `<models-dir>/asr/funasr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch`
+  - `<models-dir>/asr/funasr/speech_fsmn_vad_zh-cn-16k-common-pytorch`
+  - `<models-dir>/asr/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch`
+  - `<models-dir>/asr/funasr/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online`
+
+推荐手动下载命令：
+
+```bash
+# faster-whisper large-v3
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Systran/faster-whisper-large-v3 \
+  --local-dir ./models/asr/faster-whisper/large-v3
+
+# faster-whisper large-v3-turbo
+huggingface-cli download Systran/faster-whisper-large-v3-turbo \
+  --local-dir ./models/asr/faster-whisper/large-v3-turbo
+
+# FunASR Chinese ASR + VAD + PUNC
+pip install -U modelscope
+modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch \
+  --local_dir ./models/asr/funasr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch \
+  --local_dir ./models/asr/funasr/speech_fsmn_vad_zh-cn-16k-common-pytorch
+modelscope download --model iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch \
+  --local_dir ./models/asr/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch
+
+# FunASR Cantonese
+modelscope download --model iic/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online \
+  --local_dir ./models/asr/funasr/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online
+```
+
+---
+
+## 4.2 `POST /api/voiceDesign`
 
 用于声音设计推理。
 
@@ -247,7 +363,7 @@ data/
 
 ---
 
-## 4.2 `POST /api/clone`
+## 4.3 `POST /api/clone`
 
 用于基于参考音频的克隆推理。
 
@@ -278,7 +394,7 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 
 ---
 
-## 4.3 `POST /api/customVoice`
+## 4.4 `POST /api/customVoice`
 
 用于正式音色配音。
 
@@ -286,10 +402,10 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 
 ```json
 {
-  "modelId": "data/voiceLibrary/voices/voice_xxx/model",
   "voice": "user_001_voice",
   "text": "欢迎来到我们的节目。",
   "language": "Chinese",
+  "dialect": "beijing_dialect",
   "instruct": "更温柔一点",
   "responseFormat": "base64",
   "seed": 0,
@@ -304,23 +420,25 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 
 - 如果模型只支持一个 `voice`，允许不传，服务端会自动补上
 - 如果模型支持多个 `voice`，则必须显式传入
+- `customVoice` 额外支持可选 `dialect`
+- 当前 `dialect` 只支持 `beijing_dialect` 和 `sichuan_dialect`
+- 传 `dialect` 时，`language` 仍然是独立字段；建议使用 `Chinese` 或 `Auto`
+- `instruct` 是风格/表现控制，和 `dialect` 无关
 
 ---
 
-## 4.4 `POST /api/trainVoice`
+## 4.5 `POST /api/trainVoice`
 
 唯一训练接口。
 
 该接口做的事情：
 
-1. 创建草稿目录
-2. 在系统临时目录中准备用户上传音频
-3. 生成 `train_raw.jsonl`
-4. 调用官方 `prepare_data.py`
-5. 调用官方 `sft_12hz.py`
-6. 找到最新 `checkpoint`
-7. 自动生成试听音频
-8. 清理中间产物，只保留 `train.log`、最新 `checkpoint` 和 `preview.wav`
+1. 创建项目内 `data/train/tmp/` 工作目录
+2. 读取上传音频并在内存中统一转换到 `24kHz`
+3. 调用仓内训练模块编码训练样本
+4. 执行 speaker package 训练
+5. 将训练产出的 voice package 直接注册到 `data/voices/`
+6. 训练结束后自动清理对应工作子目录
 
 请求：
 
@@ -330,17 +448,10 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
   -F "modelId=Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
   -F "speakerName=user_001_voice" \
-  -F "previewText=欢迎来到我们的节目。" \
-  -F "previewInstruct=温柔、自然、偏轻松" \
   -F "language=Chinese" \
   -F "batchSize=8" \
   -F "lr=2e-6" \
   -F "numEpochs=3" \
-  -F "seed=0" \
-  -F "maxNewTokens=2048" \
-  -F "temperature=0.9" \
-  -F "topP=1.0" \
-  -F "repetitionPenalty=1.05" \
   -F "refAudio=@/path/to/ref.wav" \
   -F "sampleAudios=@/path/to/sample1.wav" \
   -F "sampleTexts=你好，欢迎使用。" \
@@ -350,97 +461,43 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
 
 响应：
 
-```json
-{
-  "ok": true,
-  "taskId": "train_20260402_xxxxxxxx",
-  "status": "queued",
-  "queuePosition": 1
-}
+响应类型：`text/event-stream`
+
+```text
+id: 2
+event: status
+data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"queued","speakerName":"user_001_voice","voiceId":null,"voice":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+
+id: 3
+event: status
+data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"running","speakerName":"user_001_voice","voiceId":null,"voice":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+
+id: 4
+event: status
+data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed","speakerName":"user_001_voice","voiceId":"voice_20260412_113045_123456","voice":"user_001_voice","baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
 ```
 
 说明：
 
 - 这里的训练是单 speaker 微调
 - 服务端固定使用 `Qwen/Qwen3-TTS-Tokenizer-12Hz`，调用方不需要也不能再传 `tokenizerModelId`
-- `previewInstruct` 不参与训练，只用于训练完成后的试听
-- `seed`、`maxNewTokens`、`temperature`、`topP`、`repetitionPenalty` 在这个接口里只作用于训练完成后的自动试听生成
 - 当前训练数据仍然必须有文本
 - `sampleAudios` 和 `sampleTexts` 必须按顺序一一对应，数量必须一致
 - 训练使用服务启动时已经选定的设备，不在请求中单独传 `device`
-- 上传音频只在训练任务的数据准备阶段暂存于系统临时目录，不会持久化保存到 `data/`
+- 上传音频不会持久化保存到 `data/`，只在内存中解码和重采样
+- 训练进度日志只输出到 API 服务终端
+- 调用方需要按 `SSE` 流持续读取响应体，而不是等一个普通 JSON
+- 状态会按 `queued`、`running`、`completed` / `failed` / `rejected` 推进
+- 连接空闲时服务端会发送 `: keep-alive`
 
 ---
 
-## 4.5 `GET /api/trainVoice/{taskId}`
+## 4.6 `GET /api/voices`
 
-查询训练状态。
+列出当前服务 `custom_voice_model_id` 对应 backbone 下可用的音色：
 
-返回：
-
-```json
-{
-  "ok": true,
-  "taskId": "train_20260402_xxxxxxxx",
-  "status": "preview_ready",
-  "speakerName": "user_001_voice",
-  "jobId": "trainVoice_20260402_xxxxxxxx",
-  "queuePosition": 1,
-  "draftModelId": "data/voiceLibrary/drafts/train_20260402_xxxxxxxx/training/checkpoint-epoch-2",
-  "previewAudioUrl": "/api/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/preview/preview.wav",
-  "logUrl": "/api/files/voiceLibrary/drafts/train_20260402_xxxxxxxx/training/train.log"
-}
-```
-
-状态枚举：
-
-- `queued`
-- `running`
-- `preview_ready`
-- `failed`
-- `rejected`
-- `saved`
-
----
-
-## 4.6 `POST /api/deployVoice`
-
-把草稿模型转成正式音色。
-
-请求：
-
-```json
-{
-  "taskId": "train_20260402_xxxxxxxx",
-  "voiceName": "客服女声A"
-}
-```
-
-保存逻辑：
-
-- 拷贝草稿目录中的 `preview/`
-- 将最新 `checkpoint-epoch-*` 拷贝到正式目录的 `model/`
-- 生成新的 `voiceId`
-- 正式模型路径写入 `modelId`
-
-返回：
-
-```json
-{
-  "ok": true,
-  "voiceId": "voice_20260402_xxxxxxxx",
-  "voiceName": "客服女声A",
-  "voice": "user_001_voice",
-  "modelId": "data/voiceLibrary/voices/voice_20260402_xxxxxxxx/model",
-  "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav"
-}
-```
-
----
-
-## 4.7 `GET /api/voices`
-
-列出正式音色库。
+- 模型内置 speaker
+- 已注册且与当前 backbone 兼容的 custom speaker
 
 返回：
 
@@ -450,12 +507,41 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
   "voices": [
     {
       "voiceId": "voice_20260402_xxxxxxxx",
-      "voiceName": "客服女声A",
+      "speaker": "user_001_voice",
       "voice": "user_001_voice",
-      "modelId": "data/voiceLibrary/voices/voice_20260402_xxxxxxxx/model",
-      "previewAudioUrl": "/api/files/voiceLibrary/voices/voice_20260402_xxxxxxxx/preview/preview.wav"
+      "speakerName": "user_001_voice",
+      "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "source": "custom",
+      "deletable": true
+    },
+    {
+      "voiceId": null,
+      "speaker": "Serena",
+      "voice": "Serena",
+      "speakerName": "Serena",
+      "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "enabled": true,
+      "source": "builtin",
+      "deletable": false
     }
   ]
+}
+```
+
+---
+
+## 4.7 `DELETE /api/voices/{voiceId}`
+
+删除一个已注册的自定义音色。
+
+返回：
+
+```json
+{
+  "ok": true,
+  "voiceId": "voice_20260412_102050_944573",
+  "speaker": "user_001_voice",
+  "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base"
 }
 ```
 
@@ -470,29 +556,31 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
 - `FastAPI`
 - `uvicorn`
 - `threading`
-- `subprocess`
-- `urllib`
+- `queue`
 - `soundfile`
+- `librosa`
 
 其中：
 
 - `api/main.py` 负责 CLI、设备选择、启动打印、`uvicorn.run(...)`
 - `api/app.py` 负责 `FastAPI` 路由和异常处理
+- `api/asr.py` 负责转录模型调度和 provider 选择
 - `api/runtime.py` 负责模型缓存、队列、训练任务编排
 - `api/service.py` 负责接口业务逻辑
 - `api/schemas.py` 负责请求模型
 
-## 5.2 训练不重写，只编排官方脚本
+## 5.2 训练由仓内模块编排
 
-训练流程必须直接调用官方脚本：
+训练流程当前直接调用仓内训练模块：
 
-- `finetuning/prepare_data.py`
-- `finetuning/sft_12hz.py`
+- `qwen_tts.training.encode_training_records(...)`
+- `qwen_tts.training.train_speaker_package(...)`
 
-这样做的好处：
+当前实现特点：
 
-- 不偏离官方训练逻辑
-- 后续官方修训练脚本时更容易跟进
+- 上传音频在内存中完成解码和重采样
+- 不生成 `train.log`
+- 成功后直接注册 voice package 到 `VoiceRegistry`
 
 ## 5.3 推理做模型缓存
 
@@ -517,8 +605,9 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
 
 ## 5.5 草稿与正式库分离
 
-- 草稿只放在 `data/voiceLibrary/drafts/`
-- 用户点击保存后，才进入 `data/voiceLibrary/voices/`
+- `data/voices/` 保存已注册的自定义音色 package
+- 训练过程只使用项目内 `data/train/tmp/` 工作目录，任务结束后自动清理
+- 训练成功后服务端直接完成注册，不存在单独的 `deployVoice` 保存步骤
 
 ## 5.6 禁止自动降级到 CPU
 
@@ -583,6 +672,12 @@ start_api_windows.bat --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -e ".[runtime,api]"
+```
+
+如果需要 `POST /api/transcribe`：
+
+```bash
+pip install -e ".[runtime,api,asr]"
 ```
 
 > Before installing API dependencies, install a PyTorch build that matches the target machine from https://pytorch.org/get-started/locally/ . The project does not auto-pick a GPU-specific PyTorch build for users.
@@ -657,7 +752,9 @@ Do you want to continue on CPU? [y/N]
     "running": 1,
     "queued": 0
   },
-  "dataDir": "/path/to/Qwen3-TTS/data"
+  "dataDir": "/path/to/Qwen3-TTS/data",
+  "modelsDir": "/path/to/Qwen3-TTS/models",
+  "asrModelsDir": "/path/to/Qwen3-TTS/models/asr"
 }
 ```
 
@@ -667,7 +764,6 @@ Do you want to continue on CPU? [y/N]
 
 1. 用户上传多段音频并填写文本
 2. 调 `POST /api/trainVoice`
-3. 轮询 `GET /api/trainVoice/{taskId}`
-4. 状态变成 `preview_ready` 后播放 `previewAudioUrl`
-5. 用户满意则调 `POST /api/deployVoice`
-6. 后续用返回的 `modelId + voice` 调 `POST /api/customVoice`
+3. 持续读取同一个 `POST /api/trainVoice` 响应流中的 `SSE`
+4. 收到 `completed` 事件后，取返回里的 `voice` 或 `speakerName`
+5. 后续直接用该 `voice` 调 `POST /api/customVoice`

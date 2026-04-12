@@ -6,7 +6,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.runtime import AppState, QueueFullError
-from api.schemas import CloneRequest, CustomVoiceRequest, DeployVoiceRequest, TrainVoiceRequest, VoiceDesignRequest
+from api.schemas import (
+    CloneRequest,
+    CustomVoiceRequest,
+    TrainVoiceRequest,
+    TranscribeRequest,
+    VoiceDesignRequest,
+)
 from api.service import ApiService
 
 
@@ -60,13 +66,9 @@ def create_app(state: AppState) -> FastAPI:
     def voices():
         return service.get_voices()
 
-    @app.get(f"{api_prefix}/trainVoice/{{task_id}}")
-    def train_status(task_id: str):
-        return service.get_train_status(task_id)
-
-    @app.get(f"{api_prefix}/files/{{file_path:path}}")
-    def files(file_path: str):
-        return service.get_data_file_response(file_path)
+    @app.post(f"{api_prefix}/transcribe")
+    async def transcribe(request: TranscribeRequest = Depends(TranscribeRequest.as_form)):
+        return service.transcribe(await request.to_payload())
 
     @app.post(f"{api_prefix}/voiceDesign")
     def voice_design(request: VoiceDesignRequest):
@@ -84,11 +86,12 @@ def create_app(state: AppState) -> FastAPI:
         return service.build_audio_response(result)
 
     @app.post(f"{api_prefix}/trainVoice")
-    async def train_voice(request: TrainVoiceRequest = Depends(TrainVoiceRequest.as_form)):
-        return service.train_voice(await request.to_payload())
+    async def train_voice(http_request: Request, request: TrainVoiceRequest = Depends(TrainVoiceRequest.as_form)):
+        result = service.train_voice(await request.to_payload())
+        return service.stream_train_status(result["taskId"], http_request)
 
-    @app.post(f"{api_prefix}/deployVoice")
-    def deploy_voice(request: DeployVoiceRequest):
-        return service.deploy_voice(request.model_dump(exclude_none=True))
+    @app.delete(f"{api_prefix}/voices/{{voice_id}}")
+    def delete_voice(voice_id: str):
+        return service.delete_voice(voice_id)
 
     return app

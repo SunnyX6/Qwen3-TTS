@@ -138,6 +138,41 @@ If you want to run the API server from source, install the API dependencies as w
 pip install -e ".[runtime,api]"
 ```
 
+If you also want to use `POST /api/transcribe`, install the ASR dependencies:
+
+```bash
+pip install -e ".[runtime,api,asr]"
+```
+
+For the transcribe API, the project now prefers local ASR model directories under `./models/asr` when they exist:
+
+```text
+./models/asr/faster-whisper/<modelSize>
+./models/asr/funasr/<repo-name>
+```
+
+Recommended manual download examples:
+
+```bash
+# faster-whisper
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Systran/faster-whisper-large-v3 \
+  --local-dir ./models/asr/faster-whisper/large-v3
+
+# FunASR Chinese
+pip install -U modelscope
+modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch \
+  --local_dir ./models/asr/funasr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch \
+  --local_dir ./models/asr/funasr/speech_fsmn_vad_zh-cn-16k-common-pytorch
+modelscope download --model iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch \
+  --local_dir ./models/asr/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch
+
+# FunASR Cantonese
+modelscope download --model iic/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online \
+  --local_dir ./models/asr/funasr/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online
+```
+
 The included launcher scripts (`start_api_mac.sh` and `start_api_windows.bat`) only use the project-local Conda environment at `./py312`. If you want to start the API through those scripts, create `py312` in the repository root, install a matching PyTorch build first, and then install `.[runtime,api]`. The scripts now ask whether to enable FlashAttention: choose `Y` to use it (and they will show the install command if `flash_attn` is missing), or choose `N` to start with `--no-flash-attn`.
 
 The API now runs as a single process and uses the in-process GPU queue to absorb concurrent requests. `--max-gpu-queue-size` defaults to `2`, which means up to 2 waiting GPU jobs can be queued behind the active one.

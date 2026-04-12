@@ -29,6 +29,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from qwen_tts.core.models import register_qwen3_tts_auto_classes
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -46,6 +47,12 @@ def train():
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument(
+        "--flash-attn",
+        dest="flash_attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args()
 
     accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
@@ -54,9 +61,10 @@ def train():
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2" if args.flash_attn else None,
     )
+    register_qwen3_tts_auto_classes()
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
     train_data = open(args.train_jsonl).readlines()

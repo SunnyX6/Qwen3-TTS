@@ -55,6 +55,7 @@ def _serialize_config(config: ServerConfig) -> str:
         "data_dir": str(config.data_dir),
         "models_dir": str(config.models_dir),
         "max_gpu_queue_size": config.max_gpu_queue_size,
+        "custom_voice_model_id": config.custom_voice_model_id,
     }
     return json.dumps(payload)
 
@@ -75,6 +76,7 @@ def _load_config_from_env() -> ServerConfig:
         data_dir=Path(payload["data_dir"]).resolve(),
         models_dir=Path(payload["models_dir"]).resolve(),
         max_gpu_queue_size=int(payload["max_gpu_queue_size"]),
+        custom_voice_model_id=str(payload["custom_voice_model_id"]),
     )
 
 
@@ -123,6 +125,7 @@ def main() -> int:
         data_dir=Path(args.data_dir).resolve(),
         models_dir=Path(args.models_dir).resolve(),
         max_gpu_queue_size=int(args.max_gpu_queue_size),
+        custom_voice_model_id=str(args.custom_voice_model_id),
     )
 
     try:
@@ -150,7 +153,9 @@ def main() -> int:
     print(f"Device name: {config.device_name}")
     print(f"Data dir: {config.data_dir}")
     print(f"Models dir: {config.models_dir}")
+    print(f"ASR local model root: {config.models_dir / 'asr'}")
     print(f"Max GPU queue size: {config.max_gpu_queue_size}")
+    print(f"Custom voice backbone: {config.custom_voice_model_id}")
     print(f"Qwen3-TTS API listening on http://{config.host}:{config.port}/api")
 
     os.environ[SERVER_CONFIG_ENV] = _serialize_config(config)

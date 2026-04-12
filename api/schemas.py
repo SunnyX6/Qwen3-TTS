@@ -5,6 +5,7 @@ from typing import Literal, Optional
 
 from fastapi import File, Form, UploadFile
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from api.asr import DEFAULT_ASR_MODEL_SIZE
 from api.common import (
     DEFAULT_GENERATION_MAX_NEW_TOKENS,
     DEFAULT_GENERATION_REPETITION_PENALTY,
@@ -41,22 +42,26 @@ class GenerationOptionsModel(BaseRequestModel):
 
 
 class AudioRequestModel(GenerationOptionsModel):
-    modelId: str
     text: str
     language: str = "Auto"
     responseFormat: Literal["base64", "wav"] = "base64"
 
 
-class VoiceDesignRequest(AudioRequestModel):
+class ModelBoundAudioRequestModel(AudioRequestModel):
+    modelId: str
+
+
+class VoiceDesignRequest(ModelBoundAudioRequestModel):
     instruct: str
 
 
 class CustomVoiceRequest(AudioRequestModel):
-    voice: Optional[str] = None
+    voice: str
     instruct: Optional[str] = None
+    dialect: Optional[str] = None
 
 
-class CloneRequestForm(AudioRequestModel):
+class CloneRequestForm(ModelBoundAudioRequestModel):
     refText: Optional[str] = None
     xVectorOnlyMode: bool = False
 
@@ -106,15 +111,13 @@ class CloneRequest:
         return payload
 
 
-class TrainVoiceRequestForm(GenerationOptionsModel):
+class TrainVoiceRequestForm(BaseRequestModel):
     modelId: str
     speakerName: str
-    previewText: str
     sample_texts: list[str] = Field(
         validation_alias=AliasChoices("sampleTexts", "sample_texts"),
         serialization_alias="sampleTexts",
     )
-    previewInstruct: Optional[str] = None
     language: str = "Auto"
     batchSize: int = 8
     lr: float = 2e-6
@@ -132,18 +135,11 @@ class TrainVoiceRequest:
         cls,
         modelId: str = Form(...),
         speakerName: str = Form(...),
-        previewText: str = Form(...),
         sampleTexts: list[str] = Form(...),
-        previewInstruct: Optional[str] = Form(None),
         language: str = Form("Auto"),
         batchSize: int = Form(8),
         lr: float = Form(2e-6),
         numEpochs: int = Form(3),
-        seed: int = Form(DEFAULT_GENERATION_SEED),
-        topP: float = Form(DEFAULT_GENERATION_TOP_P),
-        temperature: float = Form(DEFAULT_GENERATION_TEMPERATURE),
-        repetitionPenalty: float = Form(DEFAULT_GENERATION_REPETITION_PENALTY),
-        maxNewTokens: int = Form(DEFAULT_GENERATION_MAX_NEW_TOKENS),
         refAudio: UploadFile = File(...),
         sampleAudios: list[UploadFile] = File(...),
     ) -> "TrainVoiceRequest":
@@ -151,18 +147,11 @@ class TrainVoiceRequest:
             form=TrainVoiceRequestForm(
                 modelId=modelId,
                 speakerName=speakerName,
-                previewText=previewText,
                 sample_texts=sampleTexts,
-                previewInstruct=previewInstruct,
                 language=language,
                 batchSize=batchSize,
                 lr=lr,
                 numEpochs=numEpochs,
-                seed=seed,
-                max_new_tokens=maxNewTokens,
-                top_p=topP,
-                temperature=temperature,
-                repetition_penalty=repetitionPenalty,
             ),
             refAudio=refAudio,
             sampleAudios=sampleAudios,
@@ -194,6 +183,48 @@ class TrainVoiceRequest:
         return payload
 
 
-class DeployVoiceRequest(BaseRequestModel):
-    taskId: str
-    speakerName: str
+class TranscribeRequestForm(BaseRequestModel):
+    language: str = "Auto"
+    provider: Literal["auto", "faster-whisper", "funasr"] = "auto"
+    modelSize: str = Field(default=DEFAULT_ASR_MODEL_SIZE)
+
+
+@dataclass
+class TranscribeRequest:
+    form: TranscribeRequestForm
+    audios: list[UploadFile]
+
+    @classmethod
+    def as_form(
+        cls,
+        language: str = Form("Auto"),
+        provider: Literal["auto", "faster-whisper", "funasr"] = Form("auto"),
+        modelSize: str = Form(DEFAULT_ASR_MODEL_SIZE),
+        audios: list[UploadFile] = File(...),
+    ) -> "TranscribeRequest":
+        return cls(
+            form=TranscribeRequestForm(
+                language=language,
+                provider=provider,
+                modelSize=modelSize,
+            ),
+            audios=audios,
+        )
+
+    async def to_payload(self) -> dict:
+        if not self.audios:
+            raise ValueError("`audios` must be a non-empty list")
+
+        payload = self.form.model_dump(exclude_none=True)
+        payload["audios"] = []
+        for upload_file in self.audios:
+            audio_bytes = await upload_file.read()
+            if not audio_bytes:
+                raise ValueError(f"`audios` contains an empty file: {upload_file.filename or 'unknown'}")
+            payload["audios"].append(
+                {
+                    "audioBytes": audio_bytes,
+                    "audioFilename": upload_file.filename,
+                }
+            )
+        return payload

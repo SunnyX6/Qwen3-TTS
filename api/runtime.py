@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import gc
-import json
 import queue
-import shutil
-import subprocess
-import sys
-import tempfile
 import threading
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,23 +11,19 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from api.common import (
-    DEFAULT_GENERATION_MAX_NEW_TOKENS,
-    DEFAULT_GENERATION_REPETITION_PENALTY,
-    DEFAULT_GENERATION_SEED,
-    DEFAULT_GENERATION_TEMPERATURE,
-    DEFAULT_GENERATION_TOP_P,
-    ROOT_DIR,
-    append_log,
     ensure_dir,
-    guess_audio_extension_from_filename,
-    materialize_uploaded_audio,
+    load_demo_audio_bytes,
     read_json,
     resolve_model_ref,
-    set_generation_seed,
+    write_stdout_line,
     write_json,
 )
+from api.asr import AsrManager
 from api.config import ServerConfig
 from qwen_tts import Qwen3TTSModel
+from qwen_tts.inference.voice_registry import VoiceRegistry
+
+TRAINING_AUDIO_SAMPLE_RATE = 24000
 
 
 def parse_dtype(value: str) -> torch.dtype:
@@ -46,11 +38,19 @@ def parse_dtype(value: str) -> torch.dtype:
 
 
 class ModelManager:
-    def __init__(self, device: str, dtype: str, flash_attn: bool, models_dir: Path):
+    def __init__(
+        self,
+        device: str,
+        dtype: str,
+        flash_attn: bool,
+        models_dir: Path,
+        voice_registry: VoiceRegistry,
+    ):
         self.device = device
         self.dtype = dtype
         self.flash_attn = flash_attn
         self.models_dir = models_dir
+        self.voice_registry = voice_registry
         self._cache: Dict[str, Qwen3TTSModel] = {}
         self._lock = threading.Lock()
 
@@ -70,6 +70,7 @@ class ModelManager:
                 attn_implementation=attn_impl,
                 models_dir=self.models_dir,
             )
+            model.bind_voice_registry(self.voice_registry, base_model_id=resolved_model_id)
             self._cache = {resolved_model_id: model}
             return model
 
@@ -90,15 +91,54 @@ class TrainTaskStore:
     def __init__(self):
         self._lock = threading.Lock()
         self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._versions: Dict[str, int] = {}
+        self._conditions: Dict[str, threading.Condition] = {}
 
     def set(self, task_id: str, payload: Dict[str, Any]) -> None:
         with self._lock:
             self._tasks[task_id] = dict(payload)
+            self._versions[task_id] = self._versions.get(task_id, 0) + 1
+            condition = self._conditions.get(task_id)
+            if condition is None:
+                condition = threading.Condition(self._lock)
+                self._conditions[task_id] = condition
+            condition.notify_all()
 
     def get(self, task_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             value = self._tasks.get(task_id)
             return dict(value) if value else None
+
+    def snapshot(self, task_id: str) -> Optional[tuple[int, Dict[str, Any]]]:
+        with self._lock:
+            value = self._tasks.get(task_id)
+            if value is None:
+                return None
+            return self._versions.get(task_id, 0), dict(value)
+
+    def wait_for_update(
+        self,
+        task_id: str,
+        after_version: int,
+        timeout: Optional[float] = None,
+    ) -> Optional[tuple[int, Dict[str, Any]]]:
+        with self._lock:
+            condition = self._conditions.get(task_id)
+            if condition is None:
+                return None
+
+            def has_update() -> bool:
+                return self._versions.get(task_id, 0) > after_version
+
+            if not has_update():
+                condition.wait(timeout=timeout)
+            if not has_update():
+                return None
+
+            value = self._tasks.get(task_id)
+            if value is None:
+                return None
+            return self._versions.get(task_id, 0), dict(value)
 
 
 @dataclass
@@ -189,311 +229,388 @@ class GpuJobScheduler:
 class AppState:
     def __init__(self, config: ServerConfig):
         self.config = config
-        self.models = ModelManager(config.device, config.dtype, config.flash_attn, config.models_dir)
-        self.tasks = TrainTaskStore()
-        self.scheduler = GpuJobScheduler(config.max_gpu_queue_size)
         ensure_dir(config.data_dir)
         ensure_dir(config.models_dir)
-
-    def draft_dir(self, task_id: str) -> Path:
-        return self.config.data_dir / "voiceLibrary" / "drafts" / task_id
+        self.voice_registry = VoiceRegistry(ensure_dir(config.data_dir / "voices"))
+        self.models = ModelManager(
+            config.device,
+            config.dtype,
+            config.flash_attn,
+            config.models_dir,
+            self.voice_registry,
+        )
+        self.asr = AsrManager(
+            device=config.device,
+            device_mode=config.device_mode,
+            dtype=config.dtype,
+            models_dir=config.models_dir,
+        )
+        self.tasks = TrainTaskStore()
+        self.scheduler = GpuJobScheduler(config.max_gpu_queue_size)
 
     def voice_dir(self, voice_id: str) -> Path:
-        return self.config.data_dir / "voiceLibrary" / "voices" / voice_id
+        return self.config.data_dir / "voices" / voice_id
+
+    def train_tmp_root_dir(self) -> Path:
+        return ensure_dir(self.config.data_dir / "train" / "tmp")
 
 
-def latest_checkpoint_dir(training_dir: Path) -> Optional[Path]:
-    checkpoints = [path for path in training_dir.iterdir() if path.is_dir() and path.name.startswith("checkpoint-epoch-")]
-    if not checkpoints:
-        return None
-
-    def epoch_num(path: Path) -> int:
-        try:
-            return int(path.name.rsplit("-", 1)[-1])
-        except Exception:
-            return -1
-
-    checkpoints.sort(key=epoch_num)
-    return checkpoints[-1]
+def _load_model_config_payload(model_ref: str) -> dict[str, Any]:
+    config_path = Path(model_ref) / "config.json"
+    payload = read_json(config_path, default=None)
+    return payload if isinstance(payload, dict) else {}
 
 
-def build_train_raw_jsonl(samples: List[Dict[str, Any]], ref_audio_path: Path, out_jsonl: Path) -> None:
-    lines: List[str] = []
-    for sample in samples:
-        lines.append(
-            json.dumps(
-                {
-                    "audio": str(Path(sample["localAudioPath"]).resolve()),
-                    "text": sample["text"],
-                    "ref_audio": str(ref_audio_path.resolve()),
-                },
-                ensure_ascii=False,
-            )
-        )
-    ensure_dir(out_jsonl.parent)
-    with out_jsonl.open("w", encoding="utf-8") as file_obj:
-        for line in lines:
-            file_obj.write(line + "\n")
+def _replace_qwen_variant(model_ref: str, target_suffix: str) -> str:
+    normalized = str(model_ref).strip()
+    for source_suffix in ("-Base", "-CustomVoice"):
+        if normalized.endswith(source_suffix):
+            return normalized[: -len(source_suffix)] + target_suffix
+    return normalized
 
 
-def run_command(cmd: List[str], cwd: Path, log_path: Path) -> None:
-    append_log(log_path, f"$ {' '.join(cmd)}")
-    with log_path.open("a", encoding="utf-8") as log_file:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        return_code = process.wait()
-    if return_code != 0:
-        raise RuntimeError(f"Command failed with exit code {return_code}: {' '.join(cmd)}")
-
-
-def generate_preview(
-    model_manager: ModelManager,
+def resolve_train_model_pair(
     model_id: str,
-    voice: str,
-    text: str,
-    language: str,
-    instruct: Optional[str],
-    output_path: Path,
-    seed: Optional[int] = None,
-    max_new_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    repetition_penalty: Optional[float] = None,
-) -> tuple[Path, int]:
-    import soundfile as sf
+    models_dir: Path,
+    *,
+    expected_runtime_model_id: Optional[str] = None,
+) -> tuple[str, str]:
+    requested_model_ref = resolve_model_ref(model_id, models_dir)
+    requested_config = _load_model_config_payload(requested_model_ref)
+    requested_tts_model_type = str(requested_config.get("tts_model_type", "")).strip().lower()
 
-    set_generation_seed(seed if seed is not None else DEFAULT_GENERATION_SEED)
-    model = model_manager.get(model_id)
-    generation_kwargs = {
-        "max_new_tokens": int(
-            DEFAULT_GENERATION_MAX_NEW_TOKENS
-            if max_new_tokens is None
-            else max_new_tokens
-        ),
-        "temperature": float(
-            DEFAULT_GENERATION_TEMPERATURE if temperature is None else temperature
-        ),
-        "top_p": float(DEFAULT_GENERATION_TOP_P if top_p is None else top_p),
-        "repetition_penalty": float(
-            DEFAULT_GENERATION_REPETITION_PENALTY
-            if repetition_penalty is None
-            else repetition_penalty
-        ),
-    }
-    wavs, sample_rate = model.generate_custom_voice(
-        text=text,
-        language=language or "Auto",
-        speaker=voice,
-        instruct=instruct or None,
-        **generation_kwargs,
+    if requested_tts_model_type == "base":
+        train_model_ref = requested_model_ref
+        runtime_model_ref = resolve_model_ref(_replace_qwen_variant(requested_model_ref, "-CustomVoice"), models_dir)
+    elif requested_tts_model_type == "custom_voice":
+        runtime_model_ref = requested_model_ref
+        train_model_ref = resolve_model_ref(_replace_qwen_variant(requested_model_ref, "-Base"), models_dir)
+    elif requested_model_ref.endswith("-Base"):
+        train_model_ref = requested_model_ref
+        runtime_model_ref = resolve_model_ref(_replace_qwen_variant(requested_model_ref, "-CustomVoice"), models_dir)
+    elif requested_model_ref.endswith("-CustomVoice"):
+        runtime_model_ref = requested_model_ref
+        train_model_ref = resolve_model_ref(_replace_qwen_variant(requested_model_ref, "-Base"), models_dir)
+    else:
+        raise ValueError("Training model must be a Qwen3-TTS Base or CustomVoice model from the same family")
+
+    train_config = _load_model_config_payload(train_model_ref)
+    runtime_config = _load_model_config_payload(runtime_model_ref)
+    if train_config and str(train_config.get("tts_model_type", "")).strip().lower() != "base":
+        raise ValueError(f"Training source model must resolve to a Base model: {train_model_ref}")
+    if runtime_config and str(runtime_config.get("tts_model_type", "")).strip().lower() != "custom_voice":
+        raise ValueError(f"Runtime backbone must resolve to a CustomVoice model: {runtime_model_ref}")
+
+    if expected_runtime_model_id is not None:
+        resolved_expected_runtime_model_id = resolve_model_ref(expected_runtime_model_id, models_dir)
+        if runtime_model_ref != resolved_expected_runtime_model_id:
+            raise ValueError(
+                "Training request does not match the configured shared CustomVoice backbone: "
+                f"expected {resolved_expected_runtime_model_id}, got {runtime_model_ref}"
+            )
+    return train_model_ref, runtime_model_ref
+
+
+def resolve_public_base_model_id(model_id: str, models_dir: Path) -> str:
+    resolved_model_id = resolve_model_ref(model_id, models_dir)
+    config_payload = _load_model_config_payload(resolved_model_id)
+    tts_model_type = str(config_payload.get("tts_model_type", "")).strip().lower()
+    if tts_model_type == "custom_voice" or resolved_model_id.endswith("-CustomVoice"):
+        paired_model_ref = _replace_qwen_variant(resolved_model_id, "-Base")
+        try:
+            return resolve_model_ref(paired_model_ref, models_dir)
+        except Exception:
+            return paired_model_ref
+    return resolved_model_id
+
+
+def prepare_training_records(payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[str]]:
+    logs: List[str] = []
+    ref_audio, ref_sample_rate = load_demo_audio_bytes(
+        payload["refAudioBytes"],
+        target_sample_rate=TRAINING_AUDIO_SAMPLE_RATE,
     )
-    ensure_dir(output_path.parent)
-    sf.write(str(output_path), wavs[0], sample_rate)
-    return output_path, sample_rate
+    if ref_sample_rate != TRAINING_AUDIO_SAMPLE_RATE:
+        raise ValueError(f"Reference audio must resolve to {TRAINING_AUDIO_SAMPLE_RATE}Hz")
+    logs.append(
+        "Prepared refAudio in memory "
+        f"({payload.get('refAudioFilename') or 'refAudio'} -> {ref_sample_rate}Hz)"
+    )
 
-
-def prepare_training_audio_files(temp_dir: Path, payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], Path]:
-    dataset_dir = ensure_dir(temp_dir)
-    ref_ext = guess_audio_extension_from_filename(payload.get("refAudioFilename"))
-    ref_path = dataset_dir / f"ref{ref_ext}"
-    materialize_uploaded_audio(payload["refAudioBytes"], ref_path)
-
-    samples_out: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = []
     for index, sample in enumerate(payload["samples"], start=1):
-        extension = guess_audio_extension_from_filename(sample.get("audioFilename"))
-        sample_path = dataset_dir / f"sample_{index:04d}{extension}"
-        materialize_uploaded_audio(sample["audioBytes"], sample_path)
-        samples_out.append(
+        sample_audio, sample_rate = load_demo_audio_bytes(
+            sample["audioBytes"],
+            target_sample_rate=TRAINING_AUDIO_SAMPLE_RATE,
+        )
+        if sample_rate != TRAINING_AUDIO_SAMPLE_RATE:
+            raise ValueError(f"Sample audio must resolve to {TRAINING_AUDIO_SAMPLE_RATE}Hz")
+        records.append(
             {
+                "audio": sample_audio,
                 "text": sample["text"],
-                "localAudioPath": str(sample_path),
-                "uploadFilename": sample.get("audioFilename"),
+                "ref_audio": (ref_audio, ref_sample_rate),
             }
         )
-    return samples_out, ref_path
+        logs.append(
+            "Prepared sample audio in memory "
+            f"(#{index} {sample.get('audioFilename') or 'sample'} -> {sample_rate}Hz)"
+        )
+    return records, logs
 
 
-def update_task_meta(draft_dir: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
-    meta_path = draft_dir / "meta.json"
-    meta = read_json(meta_path, default={}) or {}
+def update_task_meta(current_meta: Optional[Dict[str, Any]], updates: Dict[str, Any]) -> Dict[str, Any]:
+    meta = dict(current_meta or {})
     meta.update(updates)
-    write_json(meta_path, meta)
     return meta
 
 
-def prune_training_artifacts(training_dir: Path, preview_dir: Path) -> None:
-    keep_checkpoint = latest_checkpoint_dir(training_dir) if training_dir.exists() else None
-    keep_training_names = {"train.log"}
-    if keep_checkpoint is not None:
-        keep_training_names.add(keep_checkpoint.name)
+def write_train_log(task_id: str, speaker_name: str, message: str) -> None:
+    write_stdout_line(f"[train][{task_id}][{speaker_name}] {message}")
 
-    if training_dir.exists():
-        for path in training_dir.iterdir():
-            if path.name in keep_training_names:
-                continue
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
 
-    if preview_dir.exists():
-        for path in preview_dir.iterdir():
-            if path.name == "preview.wav":
-                continue
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                path.unlink(missing_ok=True)
+def register_trained_voice(
+    state: AppState,
+    *,
+    task_id: str,
+    package_dir: Path,
+    speaker_name: str,
+    train_model_id: str,
+    runtime_model_id: str,
+    tokenizer_type: str = "12hz",
+    tts_model_type: str = "custom_voice",
+) -> dict[str, Any]:
+    builtin_speakers = get_builtin_speakers_for_base_model(state, runtime_model_id)
+    record = state.voice_registry.register(
+        package_dir=package_dir,
+        speaker=speaker_name,
+        base_model_id=runtime_model_id,
+        source_task_id=task_id,
+        tokenizer_type=tokenizer_type,
+        tts_model_type=tts_model_type,
+        builtin_speakers=builtin_speakers,
+    )
+    meta_path = Path(record.path) / "meta.json"
+    meta = read_json(meta_path, default={}) or {}
+    meta["baseModelId"] = train_model_id
+    write_json(meta_path, meta)
+    return {
+        "voiceId": record.voice_id,
+        "speaker": record.speaker,
+        "voice": record.speaker,
+        "speakerName": record.speaker,
+        "baseModelId": train_model_id,
+        "createdAt": record.created_at,
+        "sourceTaskId": record.source_task_id,
+    }
 
 
 def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> None:
-    draft_dir = state.draft_dir(task_id)
-    training_dir = ensure_dir(draft_dir / "training")
-    preview_dir = ensure_dir(draft_dir / "preview")
-    log_path = training_dir / "train.log"
+    speaker_name = payload["speakerName"]
+    log = lambda message: write_train_log(task_id, speaker_name, message)
 
     try:
-        resolved_model_id = resolve_model_ref(payload["modelId"], state.config.models_dir)
+        from qwen_tts.training import SpeakerPackageTrainConfig, encode_training_records, train_speaker_package
+
+        resolved_train_model_id, resolved_runtime_model_id = resolve_train_model_pair(
+            payload["modelId"],
+            state.config.models_dir,
+            expected_runtime_model_id=state.config.custom_voice_model_id,
+        )
         resolved_tokenizer_model_id = resolve_model_ref(payload["tokenizerModelId"], state.config.models_dir)
+        state.asr.clear()
         state.models.clear()
         running_meta = update_task_meta(
-            draft_dir,
+            state.tasks.get(task_id),
             {
                 "taskId": task_id,
                 "status": "running",
-                "speakerName": payload["speakerName"],
-                "modelId": payload["modelId"],
+                "speakerName": speaker_name,
+                "baseModelId": resolved_train_model_id,
+                "modelId": resolved_runtime_model_id,
                 "createdAt": datetime.now().isoformat(),
-                "previewText": payload["previewText"],
-                "previewInstruct": payload.get("previewInstruct"),
                 "language": payload.get("language", "Auto"),
             },
         )
         state.tasks.set(task_id, running_meta)
+        log(f"Training source model: {resolved_train_model_id}")
+        log(f"Runtime CustomVoice backbone: {resolved_runtime_model_id}")
+        log(f"Tokenizer model: {resolved_tokenizer_model_id}")
+        train_records, preparation_logs = prepare_training_records(payload)
+        for message in preparation_logs:
+            log(message)
 
-        with tempfile.TemporaryDirectory(prefix=f"{task_id}_audio_") as tmp_dir:
-            temp_audio_dir = Path(tmp_dir)
-            samples_out, ref_audio_path = prepare_training_audio_files(temp_audio_dir, payload)
-            raw_jsonl = training_dir / "train_raw.jsonl"
-            build_train_raw_jsonl(samples_out, ref_audio_path, raw_jsonl)
-
-            coded_jsonl = training_dir / "train_with_codes.jsonl"
-            finetune_cwd = ROOT_DIR / "finetuning"
-
-            run_command(
-                [
-                    sys.executable,
-                    "prepare_data.py",
-                    "--device",
-                    state.config.device,
-                    "--tokenizer_model_path",
-                    resolved_tokenizer_model_id,
-                    "--input_jsonl",
-                    str(raw_jsonl.resolve()),
-                    "--output_jsonl",
-                    str(coded_jsonl.resolve()),
-                ],
-                cwd=finetune_cwd,
-                log_path=log_path,
-            )
-
-            run_command(
-                [
-                    sys.executable,
-                    "sft_12hz.py",
-                    "--init_model_path",
-                    resolved_model_id,
-                    "--output_model_path",
-                    str(training_dir.resolve()),
-                    "--train_jsonl",
-                    str(coded_jsonl.resolve()),
-                    "--batch_size",
-                    str(payload.get("batchSize", 8)),
-                    "--lr",
-                    str(payload.get("lr", 2e-6)),
-                    "--num_epochs",
-                    str(payload.get("numEpochs", 3)),
-                    "--speaker_name",
-                    payload["speakerName"],
-                ],
-                cwd=finetune_cwd,
-                log_path=log_path,
-            )
-
-        checkpoint_dir = latest_checkpoint_dir(training_dir)
-        if checkpoint_dir is None:
-            raise RuntimeError("No checkpoint generated")
-
-        preview_path = preview_dir / "preview.wav"
-        generate_preview(
-            model_manager=state.models,
-            model_id=str(checkpoint_dir.resolve()),
-            voice=payload["speakerName"],
-            text=payload["previewText"],
-            language=payload.get("language", "Auto"),
-            instruct=payload.get("previewInstruct"),
-            output_path=preview_path,
-            seed=payload.get("seed", DEFAULT_GENERATION_SEED),
-            max_new_tokens=payload.get("max_new_tokens"),
-            temperature=payload.get("temperature", DEFAULT_GENERATION_TEMPERATURE),
-            top_p=payload.get("top_p", DEFAULT_GENERATION_TOP_P),
-            repetition_penalty=payload.get(
-                "repetition_penalty",
-                DEFAULT_GENERATION_REPETITION_PENALTY,
-            ),
+        encoded_records = encode_training_records(
+            records=train_records,
+            tokenizer_model_path=resolved_tokenizer_model_id,
+            device=state.config.device,
+            models_dir=state.config.models_dir,
+            audio_sample_rate=TRAINING_AUDIO_SAMPLE_RATE,
+            log_fn=log,
         )
+        with tempfile.TemporaryDirectory(
+            prefix=f"qwen3_tts_train_{task_id}_",
+            dir=state.train_tmp_root_dir(),
+        ) as temp_dir:
+            train_output_dir = ensure_dir(Path(temp_dir) / "export")
+            train_result = train_speaker_package(
+                SpeakerPackageTrainConfig(
+                    train_model_id=resolved_train_model_id,
+                    runtime_model_id=resolved_runtime_model_id,
+                    tokenizer_model_id=resolved_tokenizer_model_id,
+                    train_jsonl=None,
+                    train_records=encoded_records,
+                    output_dir=train_output_dir,
+                    speaker_name=speaker_name,
+                    device=state.config.device,
+                    dtype=state.config.dtype,
+                    flash_attn=state.config.flash_attn,
+                    batch_size=int(payload.get("batchSize", 8)),
+                    lr=float(payload.get("lr", 2e-6)),
+                    num_epochs=int(payload.get("numEpochs", 3)),
+                    models_dir=state.config.models_dir,
+                ),
+                log_fn=log,
+            )
 
-        ready_meta = update_task_meta(
-            draft_dir,
+            registered_voice = register_trained_voice(
+                state,
+                task_id=task_id,
+                package_dir=train_result.package_dir,
+                speaker_name=speaker_name,
+                train_model_id=train_result.train_model_id,
+                runtime_model_id=train_result.runtime_model_id,
+                tokenizer_type=train_result.tokenizer_type,
+                tts_model_type=train_result.tts_model_type,
+            )
+
+        registered_meta = update_task_meta(
+            state.tasks.get(task_id),
             {
-                "status": "preview_ready",
-                "draftModelId": str(checkpoint_dir.resolve()),
-                "previewAudioPath": str(preview_path.resolve()),
-                "logPath": str(log_path.resolve()),
+                "status": "completed",
+                **registered_voice,
                 "updatedAt": datetime.now().isoformat(),
             },
         )
-        state.tasks.set(task_id, ready_meta)
+        state.tasks.set(task_id, registered_meta)
     except Exception as exc:
-        append_log(log_path, f"[ERROR] {type(exc).__name__}: {exc}")
+        log(f"[ERROR] {type(exc).__name__}: {exc}")
         failed_meta = update_task_meta(
-            draft_dir,
+            state.tasks.get(task_id),
             {
                 "status": "failed",
                 "error": f"{type(exc).__name__}: {exc}",
-                "logPath": str(log_path.resolve()),
                 "updatedAt": datetime.now().isoformat(),
             },
         )
         state.tasks.set(task_id, failed_meta)
     finally:
-        prune_training_artifacts(training_dir, preview_dir)
+        state.asr.clear()
         state.models.clear()
 
 
 def load_task_meta(state: AppState, task_id: str) -> Optional[Dict[str, Any]]:
-    draft_dir = state.draft_dir(task_id)
-    meta = read_json(draft_dir / "meta.json", default=None)
-    if meta:
-        return meta
     return state.tasks.get(task_id)
 
 
-def list_voices(state: AppState) -> List[Dict[str, Any]]:
+def _normalize_voice_key(payload: Dict[str, Any]) -> str:
+    return str(payload.get("voice") or payload.get("speaker") or "").strip().lower()
+
+
+def _format_builtin_speaker_display_name(speaker: str) -> str:
+    normalized = str(speaker).strip()
+    if not normalized:
+        return normalized
+    return "_".join(part[:1].upper() + part[1:] for part in normalized.split("_"))
+
+
+def _extract_builtin_speakers_from_config_payload(config_payload: dict[str, Any]) -> List[str]:
+    talker_config = config_payload.get("talker_config")
+    if not isinstance(talker_config, dict):
+        return []
+
+    speaker_map = talker_config.get("spk_id")
+    if not isinstance(speaker_map, dict):
+        return []
+
+    return sorted(
+        {str(name).strip() for name in speaker_map.keys() if str(name).strip()},
+        key=str.lower,
+    )
+
+
+def _list_builtin_voices(state: AppState) -> List[Dict[str, Any]]:
+    base_model_id = resolve_model_ref(state.config.custom_voice_model_id, state.config.models_dir)
+    public_base_model_id = resolve_public_base_model_id(base_model_id, state.config.models_dir)
+    speakers = get_builtin_speakers_for_base_model(state, base_model_id)
     out: List[Dict[str, Any]] = []
-    voices_dir = state.config.data_dir / "voiceLibrary" / "voices"
-    if not voices_dir.exists():
-        return out
-    for voice_dir in sorted(voices_dir.iterdir()):
-        meta = read_json(voice_dir / "meta.json", default=None)
+    for speaker in speakers:
+        display_name = _format_builtin_speaker_display_name(speaker)
+        out.append(
+            {
+                "voiceId": None,
+                "speaker": display_name,
+                "voice": display_name,
+                "speakerName": display_name,
+                "baseModelId": public_base_model_id,
+                "enabled": True,
+                "source": "builtin",
+                "deletable": False,
+            }
+        )
+    return out
+
+
+def get_builtin_speakers_for_base_model(state: AppState, base_model_id: str) -> List[str]:
+    speakers = _extract_builtin_speakers_from_config_payload(_load_model_config_payload(base_model_id))
+    if not speakers:
+        try:
+            speakers = state.models.get(base_model_id).get_builtin_speakers()
+        except Exception:
+            speakers = []
+    return speakers
+
+
+def list_voices(state: AppState) -> List[Dict[str, Any]]:
+    base_model_id = resolve_model_ref(state.config.custom_voice_model_id, state.config.models_dir)
+    out: List[Dict[str, Any]] = []
+    for record in state.voice_registry.list(base_model_id=base_model_id):
+        meta = read_json(Path(record.path) / "meta.json", default=None)
         if meta:
+            meta["baseModelId"] = str(
+                meta.get("baseModelId") or resolve_public_base_model_id(record.base_model_id, state.config.models_dir)
+            ).strip()
+            meta.setdefault("voice", meta.get("speaker"))
+            meta.setdefault("speakerName", meta.get("speaker"))
+            meta["source"] = "custom"
+            meta["deletable"] = True
             out.append(meta)
     return out
+
+
+def list_available_voices(state: AppState) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for payload in _list_builtin_voices(state):
+        key = _normalize_voice_key(payload)
+        if key:
+            merged[key] = payload
+    for payload in list_voices(state):
+        key = _normalize_voice_key(payload)
+        if key:
+            merged[key] = payload
+
+    custom_voices = [item for item in merged.values() if item.get("source") != "builtin"]
+    builtin_voices = [item for item in merged.values() if item.get("source") == "builtin"]
+
+    custom_voices.sort(
+        key=lambda item: (
+            str(item.get("createdAt") or ""),
+            str(item.get("voice") or item.get("speaker") or "").lower(),
+        ),
+        reverse=True,
+    )
+    builtin_voices.sort(key=lambda item: str(item.get("voice") or item.get("speaker") or "").lower())
+    return custom_voices + builtin_voices
 
 
 def _make_job_id(kind: str) -> str:

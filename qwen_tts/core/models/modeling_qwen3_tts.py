@@ -2051,6 +2051,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "subtalker_top_k": subtalker_top_k,
             "subtalker_top_p": subtalker_top_p,
             "subtalker_temperature": subtalker_temperature,
+            "pad_token_id": self.config.talker_config.codec_pad_id,
             "eos_token_id": eos_token_id
             if eos_token_id is not None
             else self.config.talker_config.codec_eos_token_id,

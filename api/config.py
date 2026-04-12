@@ -19,6 +19,7 @@ class ServerConfig:
     data_dir: Path
     models_dir: Path
     max_gpu_queue_size: int
+    custom_voice_model_id: str
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -31,4 +32,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--models-dir", default=str(DEFAULT_MODELS_DIR))
     parser.add_argument("--max-gpu-queue-size", type=int, default=2)
+    parser.add_argument(
+        "--custom-voice-model-id",
+        default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    )
     return parser

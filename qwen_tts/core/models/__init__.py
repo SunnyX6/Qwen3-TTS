@@ -13,6 +13,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from transformers import AutoConfig, AutoModel, AutoProcessor
+
 from .configuration_qwen3_tts import Qwen3TTSConfig
 from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 from .processing_qwen3_tts import Qwen3TTSProcessor
+
+
+def _safe_register_config(model_type: str, config_cls) -> None:
+    try:
+        AutoConfig.register(model_type, config_cls)
+    except ValueError:
+        pass
+
+
+def _safe_register_model(config_cls, model_cls) -> None:
+    try:
+        AutoModel.register(config_cls, model_cls)
+    except ValueError:
+        pass
+
+
+def _safe_register_processor(config_cls, processor_cls) -> None:
+    try:
+        AutoProcessor.register(config_cls, processor_cls)
+    except ValueError:
+        pass
+
+
+def register_qwen3_tts_auto_classes() -> None:
+    _safe_register_config("qwen3_tts", Qwen3TTSConfig)
+    _safe_register_model(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+    _safe_register_processor(Qwen3TTSConfig, Qwen3TTSProcessor)

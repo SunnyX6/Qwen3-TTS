@@ -16,7 +16,9 @@
 import base64
 import io
 import urllib.request
+from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -26,7 +28,16 @@ import soundfile as sf
 import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
-from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from ..core.models import (
+    Qwen3TTSConfig,
+    Qwen3TTSForConditionalGeneration,
+    Qwen3TTSProcessor,
+    register_qwen3_tts_auto_classes,
+)
+from .lora_adapter import inject_lora_adapters
+from .voice_package import VoicePackage, activate_voice_package
+from .voice_registry import VoiceRegistry
+from .voice_router import resolve_speaker_route
 from ..path_utils import resolve_pretrained_model_ref
 
 PYTORCH_INSTALL_URL = "https://pytorch.org/get-started/locally/"
@@ -56,6 +67,25 @@ LANGUAGE_ALIASES = {
     "portuguese": {"portuguese", "葡萄牙语", "葡语"},
     "spanish": {"spanish", "西班牙语", "西语"},
     "italian": {"italian", "意大利语", "意语"},
+    "beijing_dialect": {
+        "beijing_dialect",
+        "beijing dialect",
+        "北京话",
+        "北京方言",
+        "北京腔",
+        "京片子",
+    },
+    "sichuan_dialect": {
+        "sichuan_dialect",
+        "sichuan dialect",
+        "四川话",
+        "四川方言",
+        "川话",
+        "成都话",
+    },
+}
+
+CUSTOM_VOICE_DIALECT_ALIASES = {
     "beijing_dialect": {
         "beijing_dialect",
         "beijing dialect",
@@ -113,9 +143,20 @@ class Qwen3TTSModel:
           model.get_supported_languages(), model.get_supported_speakers()
     """
 
-    def __init__(self, model: Qwen3TTSForConditionalGeneration, processor):
+    def __init__(
+        self,
+        model: Qwen3TTSForConditionalGeneration,
+        processor,
+        *,
+        base_model_id: Optional[str] = None,
+    ):
         self.model = model
         self.processor = processor
+        self.base_model_id = str(base_model_id) if base_model_id else None
+        self.voice_registry: Optional[VoiceRegistry] = None
+        builtin = getattr(model, "get_supported_speakers", None)
+        raw_builtin = builtin() if callable(builtin) else None
+        self._builtin_speakers = [str(item) for item in (raw_builtin or []) if str(item).strip()]
 
         self.device = getattr(model, "device", None)
         if self.device is None:
@@ -174,9 +215,7 @@ class Qwen3TTSModel:
                     "then install runtime dependencies with: pip install -e \".[runtime]\""
                 ) from exc
 
-        AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
-        AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-        AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
+        register_qwen3_tts_auto_classes()
 
         model = AutoModel.from_pretrained(resolved_model_ref, **kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
@@ -186,7 +225,22 @@ class Qwen3TTSModel:
 
         processor = AutoProcessor.from_pretrained(resolved_model_ref, fix_mistral_regex=True,)
 
-        return cls(model=model, processor=processor)
+        return cls(
+            model=model,
+            processor=processor,
+            base_model_id=pretrained_model_name_or_path,
+        )
+
+    def bind_voice_registry(
+        self,
+        voice_registry: Optional[VoiceRegistry],
+        *,
+        base_model_id: Optional[str] = None,
+    ) -> None:
+        inject_lora_adapters(self.model.talker, rank=16, alpha=16)
+        self.voice_registry = voice_registry
+        if base_model_id:
+            self.base_model_id = str(base_model_id)
 
     def _supported_languages_set(self) -> Optional[set]:
         langs = getattr(self.model, "get_supported_languages", None)
@@ -198,13 +252,14 @@ class Qwen3TTSModel:
         return None
 
     def _supported_speakers_set(self) -> Optional[set]:
-        spks = getattr(self.model, "get_supported_speakers", None)
-        if callable(spks):
-            v = spks()
-            if v is None:
-                return None
-            return set([str(x).lower() for x in v])
-        return None
+        supported = {str(item).lower() for item in self._builtin_speakers}
+        if self.voice_registry is not None and self.base_model_id:
+            for record in self.voice_registry.list(base_model_id=self.base_model_id):
+                supported.add(record.speaker.lower())
+        return supported or None
+
+    def _builtin_speakers_set(self) -> set[str]:
+        return {str(item).lower() for item in self._builtin_speakers}
 
     def _validate_languages(self, languages: List[str]) -> None:
         """
@@ -241,6 +296,31 @@ class Qwen3TTSModel:
             if key == canonical or key in aliases:
                 return canonical
         return language
+
+    def _normalize_custom_voice_dialect(self, dialect: Optional[str]) -> Optional[str]:
+        if dialect is None:
+            return None
+        key = str(dialect).strip().lower()
+        if not key:
+            return None
+        for canonical, aliases in CUSTOM_VOICE_DIALECT_ALIASES.items():
+            if key == canonical or key in aliases:
+                return canonical
+        return str(dialect).strip()
+
+    def _validate_custom_voice_dialects(self, dialects: List[Optional[str]]) -> None:
+        bad = []
+        for dialect in dialects:
+            if dialect is None:
+                continue
+            normalized = self._normalize_custom_voice_dialect(dialect)
+            if normalized not in CUSTOM_VOICE_DIALECT_ALIASES:
+                bad.append(dialect)
+        if bad:
+            raise ValueError(
+                "Unsupported custom voice dialects: "
+                f"{bad}. Supported: {sorted(CUSTOM_VOICE_DIALECT_ALIASES)}"
+            )
 
     def _validate_speakers(self, speakers: List[Optional[str]]) -> None:
         """
@@ -775,6 +855,7 @@ class Qwen3TTSModel:
         text: Union[str, List[str]],
         speaker: Union[str, List[str]],
         language: Union[str, List[str]] = None,
+        dialect: Optional[Union[str, List[Optional[str]]]] = None,
         instruct: Optional[Union[str, List[str]]] = None,
         non_streaming_mode: bool = True,
         **kwargs,
@@ -787,6 +868,9 @@ class Qwen3TTSModel:
                 Text(s) to synthesize.
             language:
                 Language(s) for each sample.
+            dialect:
+                Optional dialect control(s) for CustomVoice. Currently supported:
+                `beijing_dialect`, `sichuan_dialect`.
             speaker:
                 Speaker name(s). Will be validated against `model.get_supported_speakers()` (case-insensitive).
             instruct:
@@ -824,28 +908,122 @@ class Qwen3TTSModel:
             )
 
         texts = self._ensure_list(text)
-        languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        languages = (
+            self._ensure_list(language)
+            if isinstance(language, list)
+            else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
+        )
+        dialects = (
+            self._ensure_list(dialect)
+            if isinstance(dialect, list)
+            else ([dialect] * len(texts) if dialect is not None else [None] * len(texts))
+        )
         speakers = self._ensure_list(speaker)
-        if self.model.tts_model_size in "0b6": # for 0b6 model, instruct is not supported
+        if self.model.tts_model_size in "0b6":
             instruct = None
-        instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
+        instructs = (
+            self._ensure_list(instruct)
+            if isinstance(instruct, list)
+            else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
+        )
 
         if len(languages) == 1 and len(texts) > 1:
             languages = languages * len(texts)
+        if len(dialects) == 1 and len(texts) > 1:
+            dialects = dialects * len(texts)
         if len(speakers) == 1 and len(texts) > 1:
             speakers = speakers * len(texts)
         if len(instructs) == 1 and len(texts) > 1:
             instructs = instructs * len(texts)
 
-        if not (len(texts) == len(languages) == len(speakers) == len(instructs)):
+        if not (len(texts) == len(languages) == len(dialects) == len(speakers) == len(instructs)):
             raise ValueError(
-                f"Batch size mismatch: text={len(texts)}, language={len(languages)}, speaker={len(speakers)}, instruct={len(instructs)}"
+                "Batch size mismatch: "
+                f"text={len(texts)}, language={len(languages)}, dialect={len(dialects)}, "
+                f"speaker={len(speakers)}, instruct={len(instructs)}"
             )
-        languages = [self._normalize_language(lang) for lang in languages]
 
-        self._validate_languages(languages)
+        normalized_languages = [self._normalize_language(lang) for lang in languages]
+        normalized_dialects = [self._normalize_custom_voice_dialect(item) for item in dialects]
+        self._validate_languages(normalized_languages)
+        self._validate_custom_voice_dialects(normalized_dialects)
+        for language_name, dialect_name in zip(normalized_languages, normalized_dialects):
+            if dialect_name is None:
+                continue
+            if language_name is not None and str(language_name).lower() not in {"auto", "chinese"}:
+                raise ValueError(
+                    "Custom voice dialect requires `language` to be `Chinese` or `Auto`, "
+                    f"got `{language_name}` with dialect `{dialect_name}`"
+                )
         self._validate_speakers(speakers)
+        effective_languages = [
+            dialect_name if dialect_name is not None else language_name
+            for language_name, dialect_name in zip(normalized_languages, normalized_dialects)
+        ]
 
+        routes = [
+            resolve_speaker_route(
+                speaker=str(item),
+                builtin_speakers=self._builtin_speakers,
+                voice_registry=self.voice_registry,
+                base_model_id=self.base_model_id,
+            )
+            for item in speakers
+        ]
+
+        grouped_indexes: dict[str, list[int]] = {}
+        for index, route in enumerate(routes):
+            key = f"{route.kind}:{route.speaker.lower()}"
+            grouped_indexes.setdefault(key, []).append(index)
+
+        wavs_by_index: List[Optional[np.ndarray]] = [None] * len(texts)
+        sample_rate: Optional[int] = None
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        for indexes in grouped_indexes.values():
+            route = routes[indexes[0]]
+            group_texts = [texts[idx] for idx in indexes]
+            group_languages = [effective_languages[idx] for idx in indexes]
+            group_speakers = [route.speaker for _ in indexes]
+            group_instructs = [instructs[idx] for idx in indexes]
+
+            package_context = nullcontext()
+            if route.kind == "custom":
+                assert route.record is not None
+                package = VoicePackage.load(Path(route.record.path))
+                package_context = activate_voice_package(self.model, package)
+
+            with package_context:
+                group_wavs, group_sr = self._generate_custom_voice_core(
+                    texts=group_texts,
+                    languages=group_languages,
+                    speakers=group_speakers,
+                    instructs=group_instructs,
+                    non_streaming_mode=non_streaming_mode,
+                    gen_kwargs=gen_kwargs,
+                )
+            if sample_rate is None:
+                sample_rate = group_sr
+            elif sample_rate != group_sr:
+                raise RuntimeError("Mismatched sample rate while generating mixed speaker batch")
+            for offset, wav in zip(indexes, group_wavs):
+                wavs_by_index[offset] = wav
+
+        if sample_rate is None:
+            raise RuntimeError("Custom voice generation returned no audio")
+        if any(wav is None for wav in wavs_by_index):
+            raise RuntimeError("Custom voice batch result is incomplete")
+        return [wav for wav in wavs_by_index if wav is not None], sample_rate
+
+    def _generate_custom_voice_core(
+        self,
+        *,
+        texts: List[str],
+        languages: List[str],
+        speakers: List[str],
+        instructs: List[Optional[str]],
+        non_streaming_mode: bool,
+        gen_kwargs: Dict[str, Any],
+    ) -> Tuple[List[np.ndarray], int]:
         input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
 
         instruct_ids: List[Optional[torch.Tensor]] = []
@@ -854,8 +1032,6 @@ class Qwen3TTSModel:
                 instruct_ids.append(None)
             else:
                 instruct_ids.append(self._tokenize_texts([self._build_instruct_text(ins)])[0])
-
-        gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
@@ -887,6 +1063,9 @@ class Qwen3TTSModel:
         if supported is None:
             return None
         return sorted(supported)
+
+    def get_builtin_speakers(self) -> List[str]:
+        return sorted({str(item) for item in self._builtin_speakers if str(item).strip()})
 
 
     def get_supported_languages(self) -> Optional[List[str]]:

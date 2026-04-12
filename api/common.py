@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import io
 import json
-import posixpath
+import sys
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import unquote
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
@@ -17,6 +17,9 @@ DEFAULT_GENERATION_MAX_NEW_TOKENS = 2048
 DEFAULT_GENERATION_TEMPERATURE = 0.9
 DEFAULT_GENERATION_TOP_P = 1.0
 DEFAULT_GENERATION_REPETITION_PENALTY = 1.05
+_STDOUT_LOCK = threading.Lock()
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -43,26 +46,16 @@ def write_json(path: Path, payload: Any) -> None:
         json.dump(payload, file_obj, ensure_ascii=False, indent=2)
 
 
-def append_log(path: Path, message: str) -> None:
-    ensure_dir(path.parent)
-    with path.open("a", encoding="utf-8") as file_obj:
-        file_obj.write(message.rstrip() + "\n")
-
-
-def tail_text(path: Path, max_chars: int = 8000) -> str:
-    if not path.exists():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    return text[-max_chars:]
-
-
-def resolve_relative_url(path: Path, data_dir: Path) -> str:
-    relative = path.resolve().relative_to(data_dir.resolve())
-    return "/api/files/" + "/".join(relative.parts)
-
-
-def normalize_file_route(relative_path: str) -> str:
-    return posixpath.normpath(unquote(relative_path)).lstrip("/")
+def write_stdout_line(message: str) -> None:
+    line = message.rstrip() + "\n"
+    with _STDOUT_LOCK:
+        try:
+            sys.stdout.write(line)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe_line = line.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            sys.stdout.write(safe_line)
+        sys.stdout.flush()
 
 
 def guess_audio_extension_from_filename(filename: Optional[str], default: str = ".wav") -> str:
@@ -129,7 +122,7 @@ def normalize_demo_audio(wav, eps: float = 1e-12, clip: bool = True):
     return y
 
 
-def load_demo_audio_bytes(audio_bytes: bytes):
+def load_demo_audio_bytes(audio_bytes: bytes, *, target_sample_rate: Optional[int] = None):
     import librosa
     import soundfile as sf
 
@@ -142,7 +135,16 @@ def load_demo_audio_bytes(audio_bytes: bytes):
         except Exception:
             file_obj.seek(0)
             wav, sample_rate = librosa.load(file_obj, sr=None, mono=False)
-    return normalize_demo_audio(wav), int(sample_rate)
+    normalized_wav = normalize_demo_audio(wav)
+    resolved_sample_rate = int(sample_rate)
+    if target_sample_rate is not None and resolved_sample_rate != int(target_sample_rate):
+        normalized_wav = librosa.resample(
+            y=normalized_wav,
+            orig_sr=resolved_sample_rate,
+            target_sr=int(target_sample_rate),
+        ).astype("float32")
+        resolved_sample_rate = int(target_sample_rate)
+    return normalize_demo_audio(normalized_wav), resolved_sample_rate
 
 
 def resolve_model_ref(model_id: str, models_dir: Path) -> str:
