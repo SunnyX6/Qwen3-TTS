@@ -13,6 +13,7 @@ from api.config import ServerConfig, build_arg_parser
 PYTORCH_INSTALL_URL = "https://pytorch.org/get-started/locally/"
 FLASH_ATTN_DOC_URL = "https://github.com/Dao-AILab/flash-attention"
 SERVER_CONFIG_ENV = "QWEN3_TTS_SERVER_CONFIG"
+_WINDOWS_CONSOLE_CTRL_HANDLER = None
 
 
 def _print_torch_setup_hint() -> None:
@@ -58,6 +59,35 @@ def _serialize_config(config: ServerConfig) -> str:
         "custom_voice_model_id": config.custom_voice_model_id,
     }
     return json.dumps(payload)
+
+
+def _install_windows_console_close_handler() -> None:
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return
+
+    CTRL_CLOSE_EVENT = 2
+    CTRL_LOGOFF_EVENT = 5
+    CTRL_SHUTDOWN_EVENT = 6
+
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    def _handle_console_event(ctrl_type: int) -> bool:
+        if ctrl_type in (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT):
+            os._exit(0)
+        return False
+
+    global _WINDOWS_CONSOLE_CTRL_HANDLER
+    _WINDOWS_CONSOLE_CTRL_HANDLER = handler_type(_handle_console_event)
+    try:
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_WINDOWS_CONSOLE_CTRL_HANDLER, True)
+    except Exception:
+        _WINDOWS_CONSOLE_CTRL_HANDLER = None
 
 
 def _load_config_from_env() -> ServerConfig:
@@ -159,6 +189,7 @@ def main() -> int:
     print(f"Qwen3-TTS API listening on http://{config.host}:{config.port}/api")
 
     os.environ[SERVER_CONFIG_ENV] = _serialize_config(config)
+    _install_windows_console_close_handler()
     uvicorn.run(
         "api.main:create_uvicorn_app",
         host=config.host,

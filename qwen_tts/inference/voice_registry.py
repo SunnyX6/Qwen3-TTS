@@ -177,8 +177,6 @@ class VoiceRegistry:
             meta_payload = {
                 "voiceId": record.voice_id,
                 "speaker": record.speaker,
-                "voice": record.speaker,
-                "speakerName": record.speaker,
                 "baseModelId": record.base_model_id,
                 "path": record.path,
                 "enabled": record.enabled,

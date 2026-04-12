@@ -56,7 +56,7 @@ class VoiceDesignRequest(ModelBoundAudioRequestModel):
 
 
 class CustomVoiceRequest(AudioRequestModel):
-    voice: str
+    speaker: str
     instruct: Optional[str] = None
     dialect: Optional[str] = None
 

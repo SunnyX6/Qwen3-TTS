@@ -119,13 +119,9 @@ data/
 
 > API and loaders now prefer the project-local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if it exists, and simple names like `Qwen3-TTS-12Hz-1.7B-Base` are treated as `./models/Qwen3-TTS-12Hz-1.7B-Base` by default.
 
-### 3.2 `voice`
+### 3.2 `speaker`
 
-对外统一叫 `voice`，不暴露底层 `speaker` 命名。
-
-`/api/customVoice` 内部会映射为：
-
-- `voice` -> `speaker`
+`/api/customVoice` 对外直接使用 `speaker`。
 
 ### 3.3 音频字段
 
@@ -402,7 +398,7 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 
 ```json
 {
-  "voice": "user_001_voice",
+  "speaker": "user_001_voice",
   "text": "欢迎来到我们的节目。",
   "language": "Chinese",
   "dialect": "beijing_dialect",
@@ -418,8 +414,8 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 
 说明：
 
-- 如果模型只支持一个 `voice`，允许不传，服务端会自动补上
-- 如果模型支持多个 `voice`，则必须显式传入
+- `speaker` 是请求必填字段
+- 训练完成后，直接把返回里的 `speaker` 传给 `customVoice`
 - `customVoice` 额外支持可选 `dialect`
 - 当前 `dialect` 只支持 `beijing_dialect` 和 `sichuan_dialect`
 - 传 `dialect` 时，`language` 仍然是独立字段；建议使用 `Chinese` 或 `Auto`
@@ -466,15 +462,15 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
 ```text
 id: 2
 event: status
-data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"queued","speakerName":"user_001_voice","voiceId":null,"voice":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"queued","speaker":"user_001_voice","voiceId":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
 
 id: 3
 event: status
-data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"running","speakerName":"user_001_voice","voiceId":null,"voice":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"running","speaker":"user_001_voice","voiceId":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
 
 id: 4
 event: status
-data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed","speakerName":"user_001_voice","voiceId":"voice_20260412_113045_123456","voice":"user_001_voice","baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed","speaker":"user_001_voice","voiceId":"voice_20260412_113045_123456","baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
 ```
 
 说明：
@@ -508,25 +504,49 @@ data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed",
     {
       "voiceId": "voice_20260402_xxxxxxxx",
       "speaker": "user_001_voice",
-      "voice": "user_001_voice",
-      "speakerName": "user_001_voice",
       "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "supportedDialects": [
+        "beijing_dialect",
+        "sichuan_dialect"
+      ],
+      "nativeDialect": null,
       "source": "custom",
       "deletable": true
     },
     {
       "voiceId": null,
       "speaker": "Serena",
-      "voice": "Serena",
-      "speakerName": "Serena",
       "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
       "enabled": true,
+      "supportedDialects": [
+        "beijing_dialect",
+        "sichuan_dialect"
+      ],
+      "nativeDialect": null,
+      "source": "builtin",
+      "deletable": false
+    },
+    {
+      "voiceId": null,
+      "speaker": "Dylan",
+      "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "enabled": true,
+      "supportedDialects": [
+        "beijing_dialect",
+        "sichuan_dialect"
+      ],
+      "nativeDialect": "beijing_dialect",
       "source": "builtin",
       "deletable": false
     }
   ]
 }
 ```
+
+说明：
+
+- `supportedDialects` 表示当前 CustomVoice backbone 可接受的方言控制参数
+- `nativeDialect` 只表示该 speaker 的原生方言属性；训练出来的自定义 speaker 固定为 `null`
 
 ---
 
@@ -765,5 +785,5 @@ Do you want to continue on CPU? [y/N]
 1. 用户上传多段音频并填写文本
 2. 调 `POST /api/trainVoice`
 3. 持续读取同一个 `POST /api/trainVoice` 响应流中的 `SSE`
-4. 收到 `completed` 事件后，取返回里的 `voice` 或 `speakerName`
-5. 后续直接用该 `voice` 调 `POST /api/customVoice`
+4. 收到 `completed` 事件后，取返回里的 `speaker`
+5. 后续直接用该 `speaker` 调 `POST /api/customVoice`

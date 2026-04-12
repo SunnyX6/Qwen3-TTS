@@ -69,10 +69,9 @@ class ApiService:
             "ok": True,
             "taskId": task_id,
             "status": meta.get("status"),
-            "speakerName": meta.get("speakerName"),
+            "speaker": meta.get("speaker"),
             "voiceId": meta.get("voiceId"),
-            "voice": meta.get("voice"),
-            "baseModelId": meta.get("baseModelId") or meta.get("modelId"),
+            "baseModelId": meta.get("baseModelId"),
             "jobId": meta.get("jobId"),
             "queuePosition": meta.get("queuePosition"),
             "error": meta.get("error"),
@@ -372,9 +371,9 @@ class ApiService:
         )
 
     def custom_voice(self, payload: Dict[str, Any]) -> AudioResult:
-        requested_voice = (payload.get("voice") or "").strip()
-        if not requested_voice:
-            raise ValueError("`voice` is required")
+        requested_speaker = (payload.get("speaker") or "").strip()
+        if not requested_speaker:
+            raise ValueError("`speaker` is required")
         generation_seed = self._resolve_generation_seed(payload)
         generation_kwargs = self._extract_generation_kwargs(payload)
         requested_language = self._resolve_requested_language(payload)
@@ -383,24 +382,24 @@ class ApiService:
         def _run_custom_voice():
             def _generate():
                 model = self.state.models.get(self.state.config.custom_voice_model_id)
-                voice = self._resolve_custom_voice(model, requested_voice)
+                speaker = self._resolve_custom_voice(model, requested_speaker)
                 wavs, sample_rate = model.generate_custom_voice(
                     text=payload["text"],
                     language=requested_language,
                     dialect=requested_dialect,
-                    speaker=voice,
+                    speaker=speaker,
                     instruct=payload.get("instruct"),
                     **generation_kwargs,
                 )
-                return wavs, sample_rate, voice
+                return wavs, sample_rate, speaker
 
             return self._seeded_model_call(generation_seed, _generate)
 
-        wavs, sample_rate, voice = self._run_gpu_job_sync(
+        wavs, sample_rate, speaker = self._run_gpu_job_sync(
             kind="customVoice",
             meta={
                 "modelId": self.state.config.custom_voice_model_id,
-                "voice": requested_voice,
+                "speaker": requested_speaker,
                 "seed": generation_seed,
             },
             fn=_run_custom_voice,
@@ -409,7 +408,7 @@ class ApiService:
             wav=wavs[0],
             sample_rate=sample_rate,
             response_format=payload.get("responseFormat", "base64"),
-            extra={"modelId": self.state.config.custom_voice_model_id, "voice": voice},
+            extra={"modelId": self.state.config.custom_voice_model_id, "speaker": speaker},
         )
 
     def train_voice(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -446,7 +445,7 @@ class ApiService:
             {
                 "taskId": task_id,
                 "status": "queued",
-                "speakerName": payload["speakerName"],
+                "speaker": payload["speakerName"],
                 "baseModelId": resolved_train_model_id,
                 "modelId": resolved_runtime_model_id,
                 "createdAt": datetime.now().isoformat(),
@@ -457,7 +456,7 @@ class ApiService:
         try:
             handle, position = self.state.scheduler.submit(
                 kind="trainVoice",
-                meta={"taskId": task_id, "speakerName": payload["speakerName"]},
+                meta={"taskId": task_id, "speaker": payload["speakerName"]},
                 fn=lambda: run_train_task(self.state, task_id, payload),
             )
         except QueueFullError:
@@ -520,10 +519,10 @@ class ApiService:
         self.state.asr.clear()
 
     @staticmethod
-    def _resolve_custom_voice(model: Qwen3TTSModel, requested_voice: Optional[str]) -> str:
+    def _resolve_custom_voice(model: Qwen3TTSModel, requested_speaker: Optional[str]) -> str:
         supported = model.get_supported_speakers() or []
-        if requested_voice:
-            return requested_voice
+        if requested_speaker:
+            return requested_speaker
         if len(supported) == 1:
             return supported[0]
-        raise ValueError("`voice` is required for models that expose multiple voices")
+        raise ValueError("`speaker` is required for models that expose multiple speakers")

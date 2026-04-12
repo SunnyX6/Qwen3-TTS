@@ -397,8 +397,6 @@ def register_trained_voice(
     return {
         "voiceId": record.voice_id,
         "speaker": record.speaker,
-        "voice": record.speaker,
-        "speakerName": record.speaker,
         "baseModelId": train_model_id,
         "createdAt": record.created_at,
         "sourceTaskId": record.source_task_id,
@@ -425,7 +423,7 @@ def run_train_task(state: AppState, task_id: str, payload: Dict[str, Any]) -> No
             {
                 "taskId": task_id,
                 "status": "running",
-                "speakerName": speaker_name,
+                "speaker": speaker_name,
                 "baseModelId": resolved_train_model_id,
                 "modelId": resolved_runtime_model_id,
                 "createdAt": datetime.now().isoformat(),
@@ -514,7 +512,7 @@ def load_task_meta(state: AppState, task_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _normalize_voice_key(payload: Dict[str, Any]) -> str:
-    return str(payload.get("voice") or payload.get("speaker") or "").strip().lower()
+    return str(payload.get("speaker") or "").strip().lower()
 
 
 def _format_builtin_speaker_display_name(speaker: str) -> str:
@@ -539,10 +537,60 @@ def _extract_builtin_speakers_from_config_payload(config_payload: dict[str, Any]
     )
 
 
+def _extract_supported_dialects_from_config_payload(config_payload: dict[str, Any]) -> List[str]:
+    talker_config = config_payload.get("talker_config")
+    if not isinstance(talker_config, dict):
+        return []
+
+    codec_language_id = talker_config.get("codec_language_id")
+    if not isinstance(codec_language_id, dict):
+        return []
+
+    return sorted(
+        {
+            str(name).strip()
+            for name in codec_language_id.keys()
+            if str(name).strip() and str(name).strip().lower().endswith("_dialect")
+        },
+        key=str.lower,
+    )
+
+
+def _extract_native_dialect_map_from_config_payload(config_payload: dict[str, Any]) -> Dict[str, Optional[str]]:
+    talker_config = config_payload.get("talker_config")
+    if not isinstance(talker_config, dict):
+        return {}
+
+    speaker_map = talker_config.get("spk_id")
+    dialect_map = talker_config.get("spk_is_dialect")
+    if not isinstance(speaker_map, dict) or not isinstance(dialect_map, dict):
+        return {}
+
+    out: Dict[str, Optional[str]] = {}
+    for speaker in speaker_map.keys():
+        speaker_name = str(speaker).strip()
+        if not speaker_name:
+            continue
+        dialect_value = dialect_map.get(speaker_name.lower())
+        if isinstance(dialect_value, str) and dialect_value.strip():
+            out[speaker_name.lower()] = dialect_value.strip()
+        else:
+            out[speaker_name.lower()] = None
+    return out
+
+
+def _get_custom_voice_capabilities(state: AppState) -> tuple[str, List[str], Dict[str, Optional[str]]]:
+    runtime_model_id = resolve_model_ref(state.config.custom_voice_model_id, state.config.models_dir)
+    config_payload = _load_model_config_payload(runtime_model_id)
+    supported_dialects = _extract_supported_dialects_from_config_payload(config_payload)
+    native_dialect_map = _extract_native_dialect_map_from_config_payload(config_payload)
+    return runtime_model_id, supported_dialects, native_dialect_map
+
+
 def _list_builtin_voices(state: AppState) -> List[Dict[str, Any]]:
-    base_model_id = resolve_model_ref(state.config.custom_voice_model_id, state.config.models_dir)
-    public_base_model_id = resolve_public_base_model_id(base_model_id, state.config.models_dir)
-    speakers = get_builtin_speakers_for_base_model(state, base_model_id)
+    runtime_model_id, supported_dialects, native_dialect_map = _get_custom_voice_capabilities(state)
+    public_base_model_id = resolve_public_base_model_id(runtime_model_id, state.config.models_dir)
+    speakers = get_builtin_speakers_for_base_model(state, runtime_model_id)
     out: List[Dict[str, Any]] = []
     for speaker in speakers:
         display_name = _format_builtin_speaker_display_name(speaker)
@@ -550,10 +598,10 @@ def _list_builtin_voices(state: AppState) -> List[Dict[str, Any]]:
             {
                 "voiceId": None,
                 "speaker": display_name,
-                "voice": display_name,
-                "speakerName": display_name,
                 "baseModelId": public_base_model_id,
                 "enabled": True,
+                "supportedDialects": supported_dialects,
+                "nativeDialect": native_dialect_map.get(speaker.lower()),
                 "source": "builtin",
                 "deletable": False,
             }
@@ -572,19 +620,27 @@ def get_builtin_speakers_for_base_model(state: AppState, base_model_id: str) -> 
 
 
 def list_voices(state: AppState) -> List[Dict[str, Any]]:
-    base_model_id = resolve_model_ref(state.config.custom_voice_model_id, state.config.models_dir)
+    runtime_model_id, supported_dialects, _ = _get_custom_voice_capabilities(state)
     out: List[Dict[str, Any]] = []
-    for record in state.voice_registry.list(base_model_id=base_model_id):
+    for record in state.voice_registry.list(base_model_id=runtime_model_id):
         meta = read_json(Path(record.path) / "meta.json", default=None)
         if meta:
-            meta["baseModelId"] = str(
-                meta.get("baseModelId") or resolve_public_base_model_id(record.base_model_id, state.config.models_dir)
-            ).strip()
-            meta.setdefault("voice", meta.get("speaker"))
-            meta.setdefault("speakerName", meta.get("speaker"))
-            meta["source"] = "custom"
-            meta["deletable"] = True
-            out.append(meta)
+            out.append(
+                {
+                    "voiceId": record.voice_id,
+                    "speaker": str(meta.get("speaker") or record.speaker or "").strip(),
+                    "baseModelId": str(
+                        meta.get("baseModelId")
+                        or resolve_public_base_model_id(record.base_model_id, state.config.models_dir)
+                    ).strip(),
+                    "enabled": bool(meta.get("enabled", True)),
+                    "createdAt": str(meta.get("createdAt") or record.created_at),
+                    "supportedDialects": supported_dialects,
+                    "nativeDialect": None,
+                    "source": "custom",
+                    "deletable": True,
+                }
+            )
     return out
 
 
@@ -605,11 +661,11 @@ def list_available_voices(state: AppState) -> List[Dict[str, Any]]:
     custom_voices.sort(
         key=lambda item: (
             str(item.get("createdAt") or ""),
-            str(item.get("voice") or item.get("speaker") or "").lower(),
+            str(item.get("speaker") or "").lower(),
         ),
         reverse=True,
     )
-    builtin_voices.sort(key=lambda item: str(item.get("voice") or item.get("speaker") or "").lower())
+    builtin_voices.sort(key=lambda item: str(item.get("speaker") or "").lower())
     return custom_voices + builtin_voices
 
 

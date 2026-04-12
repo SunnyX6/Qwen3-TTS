@@ -8,6 +8,7 @@ set "ENV_DIR=%SCRIPT_DIR%py312"
 set "FLASH_MODE=prompt"
 set "FLASH_ARG_PRESENT=0"
 set "FLASH_ARGS="
+set "PAUSE_ON_EXIT=0"
 
 if exist "%ENV_DIR%\python.exe" (
   for %%A in (%*) do (
@@ -64,10 +65,11 @@ if exist "%ENV_DIR%\python.exe" (
   echo   REM optional: if you want FlashAttention, also install: 1>&2
   echo   "%ENV_DIR%\python.exe" -m pip install flash-attn --no-build-isolation 1>&2
   set "EXIT_CODE=1"
+  set "PAUSE_ON_EXIT=1"
 )
 
 if not "!EXIT_CODE!"=="0" (
-  if "%~1"=="" (
+  if "!PAUSE_ON_EXIT!"=="1" if "%~1"=="" (
     echo.
     pause
   )
