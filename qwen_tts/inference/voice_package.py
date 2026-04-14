@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +13,6 @@ from .lora_adapter import inject_lora_adapters, collect_lora_state_dict, load_lo
 
 
 VOICE_WEIGHTS_FILENAME = "speaker.safetensors"
-VOICE_CONFIG_FILENAME = "speaker_config.json"
 SPEAKER_EMBEDDING_KEY = "speaker_embedding"
 
 
@@ -30,20 +28,12 @@ def _read_json(path: Path, default: Any = None) -> Any:
         return json.load(file_obj)
 
 
-def _write_json_atomic(path: Path, payload: Any) -> None:
-    _ensure_dir(path.parent)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as tmp_file:
-        json.dump(payload, tmp_file, ensure_ascii=False, indent=2)
-        tmp_path = Path(tmp_file.name)
-    tmp_path.replace(path)
-
-
 @dataclass(frozen=True)
 class VoicePackageConfig:
     schema_version: int
     speaker: str
     slot_id: int
-    base_model_id: str
+    speak_model_id: str
     tokenizer_type: str
     tts_model_type: str
     adapter_type: str
@@ -55,7 +45,7 @@ class VoicePackageConfig:
             schema_version=int(payload.get("schemaVersion", 1)),
             speaker=str(payload["speaker"]),
             slot_id=int(payload.get("slotId", 3000)),
-            base_model_id=str(payload["baseModelId"]),
+            speak_model_id=str(payload["speakModelId"]),
             tokenizer_type=str(payload["tokenizerType"]),
             tts_model_type=str(payload["ttsModelType"]),
             adapter_type=str(payload.get("adapterType", "lora")),
@@ -67,7 +57,7 @@ class VoicePackageConfig:
             "schemaVersion": self.schema_version,
             "speaker": self.speaker,
             "slotId": self.slot_id,
-            "baseModelId": self.base_model_id,
+            "speakModelId": self.speak_model_id,
             "tokenizerType": self.tokenizer_type,
             "ttsModelType": self.tts_model_type,
             "adapterType": self.adapter_type,
@@ -88,19 +78,15 @@ class VoicePackage:
     def weights_path(self) -> Path:
         return self.model_dir / VOICE_WEIGHTS_FILENAME
 
-    @property
-    def config_path(self) -> Path:
-        return self.model_dir / VOICE_CONFIG_FILENAME
-
     def load_tensors(self) -> dict[str, torch.Tensor]:
         return load_file(str(self.weights_path), device="cpu")
 
     @classmethod
     def load(cls, root_dir: Path) -> "VoicePackage":
         root_dir = root_dir.resolve()
-        payload = _read_json(root_dir / "model" / VOICE_CONFIG_FILENAME, default=None)
+        payload = _read_json(root_dir / "meta.json", default=None)
         if not isinstance(payload, dict):
-            raise FileNotFoundError(f"Voice package config missing: {root_dir / 'model' / VOICE_CONFIG_FILENAME}")
+            raise FileNotFoundError(f"Voice package meta missing: {root_dir / 'meta.json'}")
         return cls(root_dir=root_dir, config=VoicePackageConfig.from_payload(payload))
 
 
@@ -108,7 +94,7 @@ def save_voice_package(
     *,
     output_dir: Path,
     speaker: str,
-    base_model_id: str,
+    speak_model_id: str,
     tokenizer_type: str,
     tts_model_type: str,
     speaker_embedding: torch.Tensor,
@@ -126,13 +112,12 @@ def save_voice_package(
         schema_version=1,
         speaker=speaker,
         slot_id=slot_id,
-        base_model_id=base_model_id,
+        speak_model_id=speak_model_id,
         tokenizer_type=tokenizer_type,
         tts_model_type=tts_model_type,
         adapter_type="lora",
         lora_rank=lora_rank,
     )
-    _write_json_atomic(model_dir / VOICE_CONFIG_FILENAME, config.to_payload())
     return VoicePackage(root_dir=output_dir.resolve(), config=config)
 
 

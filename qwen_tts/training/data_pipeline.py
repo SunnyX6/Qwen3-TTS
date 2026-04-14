@@ -36,6 +36,7 @@ def encode_training_records(
     batch_size: int = DEFAULT_TOKENIZER_BATCH_SIZE,
     audio_sample_rate: int = 24000,
     log_fn: Optional[Callable[[str], None]] = None,
+    cancel_fn: Optional[Callable[[], None]] = None,
 ) -> list[dict[str, Any]]:
     if batch_size <= 0:
         raise ValueError("Tokenizer batch size must be greater than 0")
@@ -55,6 +56,8 @@ def encode_training_records(
     def flush_batch() -> None:
         if not pending_records:
             return
+        if cancel_fn is not None:
+            cancel_fn()
         first_audio = pending_audios[0]
         if isinstance(first_audio, str):
             encode_result = tokenizer.encode(pending_audios)
@@ -66,8 +69,12 @@ def encode_training_records(
             encoded_records.append(next_record)
         pending_records.clear()
         pending_audios.clear()
+        if cancel_fn is not None:
+            cancel_fn()
 
     for index, record in enumerate(records, start=1):
+        if cancel_fn is not None:
+            cancel_fn()
         pending_records.append(record)
         pending_audios.append(record["audio"])
         if len(pending_records) >= batch_size:
@@ -90,6 +97,7 @@ def encode_training_jsonl(
     models_dir: Optional[Path],
     batch_size: int = DEFAULT_TOKENIZER_BATCH_SIZE,
     log_fn: Optional[Callable[[str], None]] = None,
+    cancel_fn: Optional[Callable[[], None]] = None,
 ) -> list[dict[str, Any]]:
     raw_records = read_jsonl(input_jsonl)
     if not raw_records:
@@ -101,6 +109,7 @@ def encode_training_jsonl(
         models_dir=models_dir,
         batch_size=batch_size,
         log_fn=log_fn,
+        cancel_fn=cancel_fn,
     )
     write_jsonl(output_jsonl, encoded_records)
     if log_fn is not None:

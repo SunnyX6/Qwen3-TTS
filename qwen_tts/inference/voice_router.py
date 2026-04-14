@@ -18,7 +18,7 @@ def resolve_speaker_route(
     speaker: str,
     builtin_speakers: Iterable[str],
     voice_registry: Optional[VoiceRegistry],
-    base_model_id: Optional[str],
+    speak_model_id: Optional[str],
 ) -> SpeakerRoute:
     normalized = speaker.strip()
     if not normalized:
@@ -32,5 +32,5 @@ def resolve_speaker_route(
     if voice_registry is None:
         raise ValueError(f"Unsupported speakers: [{speaker}]")
 
-    record = voice_registry.require_speaker(normalized, base_model_id=base_model_id)
+    record = voice_registry.require_speaker(normalized, speak_model_id=speak_model_id)
     return SpeakerRoute(kind="custom", speaker=record.speaker, record=record)

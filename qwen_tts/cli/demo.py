@@ -19,6 +19,7 @@ A gradio demo for Qwen3 TTS models.
 
 import argparse
 import os
+import sys
 import tempfile
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,6 +29,7 @@ import numpy as np
 import torch
 
 from .. import Qwen3TTSModel, VoiceClonePromptItem
+from ..device import get_cpu_confirmation_reason, resolve_device, validate_flash_attn
 
 
 def _title_case_display(s: str) -> str:
@@ -98,8 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Model loading / from_pretrained args
     parser.add_argument(
         "--device",
-        default="cuda:0",
-        help="Device for device_map, e.g. cpu, cuda, cuda:0 (default: cuda:0).",
+        default="auto",
+        help="Device for device_map, e.g. auto, cpu, cuda, cuda:0, mps (default: auto).",
     )
     parser.add_argument(
         "--dtype",
@@ -618,12 +620,27 @@ def main(argv=None) -> int:
 
     ckpt = _resolve_checkpoint(args)
 
+    try:
+        resolved_device = resolve_device(args.device, torch_module=torch)
+        validate_flash_attn(
+            bool(args.flash_attn),
+            device=resolved_device.device,
+            device_mode=resolved_device.device_mode,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if resolved_device.device == "cpu":
+        cpu_reason = get_cpu_confirmation_reason(args.device, resolved_device) or "Using CPU mode."
+        print(f"{cpu_reason} Running demo on CPU will be very slow.", file=sys.stderr)
+
     dtype = _dtype_from_str(args.dtype)
     attn_impl = "flash_attention_2" if args.flash_attn else None
 
     tts = Qwen3TTSModel.from_pretrained(
         ckpt,
-        device_map=args.device,
+        device_map=resolved_device.device,
         dtype=dtype,
         attn_implementation=attn_impl,
     )

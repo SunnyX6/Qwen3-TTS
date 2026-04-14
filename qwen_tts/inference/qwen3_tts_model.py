@@ -254,7 +254,7 @@ class Qwen3TTSModel:
     def _supported_speakers_set(self) -> Optional[set]:
         supported = {str(item).lower() for item in self._builtin_speakers}
         if self.voice_registry is not None and self.base_model_id:
-            for record in self.voice_registry.list(base_model_id=self.base_model_id):
+            for record in self.voice_registry.list(speak_model_id=self.base_model_id):
                 supported.add(record.speaker.lower())
         return supported or None
 
@@ -966,7 +966,7 @@ class Qwen3TTSModel:
                 speaker=str(item),
                 builtin_speakers=self._builtin_speakers,
                 voice_registry=self.voice_registry,
-                base_model_id=self.base_model_id,
+                speak_model_id=self.base_model_id,
             )
             for item in speakers
         ]

@@ -279,16 +279,17 @@ qwen_tts/training/
 
 ### 7.2 发布流程
 
-1. `POST /api/trainVoice` 完成上传并创建任务，立即返回 `taskId`
-2. 前端或调用方基于 `taskId` 订阅训练事件流
-3. 训练任务完成，导出 `speaker package`
-4. 校验 `speaker package` 完整性
-5. 校验 `speaker` 名称是否冲突
-6. 分配新的 `voiceId`
-7. 写入 `data/voices/{voiceId}/`
-8. 原子更新 `data/voices/index.json`
-9. 运行时 `voice_registry` 立即刷新当前进程内映射
-10. 更新 `data/train/{taskId}/meta.json`，写入 `voiceId/speaker`
+1. 调用方先生成 `requestId`
+2. `POST /api/trainVoice?requestId={requestId}` 上传训练数据，并在同一条连接上等待训练终态
+3. 如用户中途取消，调用 `DELETE /api/trainVoice/{requestId}`
+4. 训练任务完成，导出 `speaker package`
+5. 校验 `speaker package` 完整性
+6. 校验 `speaker` 名称是否冲突
+7. 分配新的 `voiceId`
+8. 写入 `data/voices/{voiceId}/`
+9. 原子更新 `data/voices/index.json`
+10. 运行时 `voice_registry` 立即刷新当前进程内映射
+11. 终态返回给原始 `POST /api/trainVoice`
 
 训练接口的终态不是“preview_ready”，而是“registered”。
 
@@ -465,10 +466,12 @@ wavs, sr = model.generate_custom_voice(
 服务接口目标语义固定为：
 
 - `POST /api/trainVoice`
-  - 创建训练任务
+  - 必须带 `requestId`
+  - 请求保持到训练终态
   - 训练成功后立即注册 speaker
-- `GET /api/trainVoice/{taskId}/events`
-  - 训练状态 SSE 主通道
+- `DELETE /api/trainVoice/{requestId}`
+  - 触发取消
+  - 等待取消清理完成后返回终态
 - `GET /api/voices`
   - 返回正式 speaker bank 条目
 - `DELETE /api/voices/{voiceId}`
@@ -478,10 +481,11 @@ wavs, sr = model.generate_custom_voice(
 
 约束：
 
-- 训练进度只走 SSE
-- 不把文件上传的 `POST /api/trainVoice` 本身做成长连接事件流
-- SSE 首帧必须返回当前任务快照，因此不再保留单独的训练状态查询接口
-- 任务创建和任务订阅必须分离，否则断线恢复、应用重启恢复、任务列表回填都会变脏
+- 不新增训练状态 SSE 接口
+- 不新增训练状态查询接口
+- `POST /api/trainVoice` 本身就是长连接，但只返回一次终态 JSON
+- `DELETE /api/trainVoice/{requestId}` 也可能是长连接，因为它要等取消真正完成
+- 调用方必须自己持有 `requestId`，这样才能在训练未结束前发取消
 
 ### 11.3 Preview
 

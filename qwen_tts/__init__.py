@@ -18,7 +18,24 @@
 qwen_tts: Qwen-TTS package.
 """
 
-from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem
-from .inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from importlib import import_module
+from typing import Any
 
-__all__ = ["__version__"]
+__all__ = ["Qwen3TTSModel", "Qwen3TTSTokenizer", "VoiceClonePromptItem"]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"Qwen3TTSModel", "VoiceClonePromptItem"}:
+        module = import_module(".inference.qwen3_tts_model", __name__)
+    elif name == "Qwen3TTSTokenizer":
+        module = import_module(".inference.qwen3_tts_tokenizer", __name__)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

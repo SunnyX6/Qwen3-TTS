@@ -14,11 +14,8 @@ FLASH_MODE="prompt"
 FLASH_ARG_PRESENT=0
 PORT_ARG_PRESENT=0
 IP_ARG_PRESENT=0
-DEVICE_ARG_PRESENT=0
 POSITIONAL_CHECKPOINT_PRESENT=0
 EXPECT_VALUE=""
-SELECTED_DEVICE=""
-CUDA_AVAILABLE=0
 
 if [[ ! -x "${ENV_PYTHON}" ]]; then
   echo "Error: missing Conda environment at ${ENV_DIR}" >&2
@@ -49,8 +46,7 @@ for arg in "$@"; do
       ip)
         DISPLAY_IP="${arg}"
         ;;
-      device)
-        SELECTED_DEVICE="${arg}"
+      passthrough)
         ;;
     esac
     EXPECT_VALUE=""
@@ -77,9 +73,10 @@ for arg in "$@"; do
       IP_ARG_PRESENT=1
       EXPECT_VALUE="ip"
       ;;
-    --device)
-      DEVICE_ARG_PRESENT=1
-      EXPECT_VALUE="device"
+    --device|--dtype|--concurrency|--ssl-certfile|--ssl-keyfile)
+      EXPECT_VALUE="passthrough"
+      ;;
+    --share|--no-share|--ssl-verify|--no-ssl-verify)
       ;;
     -*)
       ;;
@@ -92,15 +89,8 @@ for arg in "$@"; do
   esac
 done
 
-if "${ENV_PYTHON}" -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" >/dev/null 2>&1; then
-  CUDA_AVAILABLE=1
-fi
-
 if [[ "${FLASH_MODE}" == "prompt" ]]; then
-  if [[ "${CUDA_AVAILABLE}" -eq 0 ]]; then
-    echo "CUDA is not available; starting with --no-flash-attn." >&2
-    FLASH_MODE="off"
-  elif [[ -t 0 ]]; then
+  if [[ -t 0 ]]; then
     echo
     read -r -p "Enable FlashAttention for Gradio demo? [y/N, N uses --no-flash-attn]: " flash_choice
     case "${flash_choice}" in
@@ -119,28 +109,7 @@ fi
 
 EXTRA_ARGS=()
 
-if [[ "${DEVICE_ARG_PRESENT}" -eq 0 ]]; then
-  if "${ENV_PYTHON}" -c "import torch; m=getattr(torch.backends, 'mps', None); ok=bool(m and getattr(m, 'is_built', lambda: True)() and getattr(m, 'is_available', lambda: False)()); raise SystemExit(0 if ok else 1)" >/dev/null 2>&1; then
-    SELECTED_DEVICE="mps"
-  else
-    SELECTED_DEVICE="cpu"
-  fi
-  EXTRA_ARGS+=(--device "${SELECTED_DEVICE}")
-fi
-
 if [[ "${FLASH_MODE}" == "on" ]]; then
-  if [[ "${CUDA_AVAILABLE}" -eq 0 ]]; then
-    echo "\`--flash-attn\` was requested, but FlashAttention requires CUDA." >&2
-    echo "Please switch to a CUDA device or run again with --no-flash-attn." >&2
-    exit 1
-  fi
-  if ! "${ENV_PYTHON}" -c "import flash_attn" >/dev/null 2>&1; then
-    echo "\`flash_attn\` is not installed in ${ENV_DIR}." >&2
-    echo "Install it in the current environment with:" >&2
-    echo "  \"${ENV_PYTHON}\" -m pip install flash-attn --no-build-isolation" >&2
-    echo "If you do not want to install it, run this script again and choose N." >&2
-    exit 1
-  fi
   if [[ "${FLASH_ARG_PRESENT}" -eq 0 ]]; then
     EXTRA_ARGS+=(--flash-attn)
   fi
@@ -159,9 +128,6 @@ fi
 
 echo "Starting Gradio demo with checkpoint:"
 echo "  ${CHECKPOINT}"
-if [[ "${DEVICE_ARG_PRESENT}" -eq 0 ]]; then
-  echo "Device: ${SELECTED_DEVICE} (auto-selected for macOS)"
-fi
 echo "Open http://${DISPLAY_IP}:${DISPLAY_PORT} after startup."
 echo
 

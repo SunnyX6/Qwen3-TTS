@@ -5,15 +5,13 @@ from typing import Literal, Optional
 
 from fastapi import File, Form, UploadFile
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
-from api.asr import DEFAULT_ASR_MODEL_SIZE
-from api.common import (
-    DEFAULT_GENERATION_MAX_NEW_TOKENS,
-    DEFAULT_GENERATION_REPETITION_PENALTY,
-    DEFAULT_GENERATION_SEED,
-    DEFAULT_GENERATION_TEMPERATURE,
-    DEFAULT_GENERATION_TOP_P,
-)
 
+DEFAULT_ASR_MODEL_SIZE = "large-v3"
+DEFAULT_GENERATION_SEED = 0
+DEFAULT_GENERATION_MAX_NEW_TOKENS = 2048
+DEFAULT_GENERATION_TEMPERATURE = 0.9
+DEFAULT_GENERATION_TOP_P = 1.0
+DEFAULT_GENERATION_REPETITION_PENALTY = 1.05
 DEFAULT_TRAIN_TOKENIZER_MODEL_ID = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 
 
@@ -56,6 +54,7 @@ class VoiceDesignRequest(ModelBoundAudioRequestModel):
 
 
 class CustomVoiceRequest(AudioRequestModel):
+    modelId: Optional[str] = None
     speaker: str
     instruct: Optional[str] = None
     dialect: Optional[str] = None
@@ -185,7 +184,6 @@ class TrainVoiceRequest:
 
 class TranscribeRequestForm(BaseRequestModel):
     language: str = "Auto"
-    provider: Literal["auto", "faster-whisper", "funasr"] = "auto"
     modelSize: str = Field(default=DEFAULT_ASR_MODEL_SIZE)
 
 
@@ -198,14 +196,12 @@ class TranscribeRequest:
     def as_form(
         cls,
         language: str = Form("Auto"),
-        provider: Literal["auto", "faster-whisper", "funasr"] = Form("auto"),
         modelSize: str = Form(DEFAULT_ASR_MODEL_SIZE),
         audios: list[UploadFile] = File(...),
     ) -> "TranscribeRequest":
         return cls(
             form=TranscribeRequestForm(
                 language=language,
-                provider=provider,
                 modelSize=modelSize,
             ),
             audios=audios,

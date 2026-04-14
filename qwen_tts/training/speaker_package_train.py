@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -79,6 +77,9 @@ class SpeakerPackageTrainResult:
     runtime_model_id: str
     tokenizer_type: str
     tts_model_type: str
+    slot_id: int
+    adapter_type: str
+    lora_rank: int
 
 
 class SpeakerPackageTrainer(nn.Module):
@@ -186,18 +187,14 @@ def _load_initial_speaker_embedding(dataset: TTSDataset, qwen_model) -> torch.Te
         ).detach()
     return embedding[0].to(dtype=model_dtype, device="cpu")
 
-
-def _save_training_summary(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file_obj:
-        json.dump(payload, file_obj, ensure_ascii=False, indent=2)
-
-
 def train_speaker_package(
     config: SpeakerPackageTrainConfig,
     *,
     log_fn: Optional[Callable[[str], None]] = None,
+    cancel_fn: Optional[Callable[[], None]] = None,
 ) -> SpeakerPackageTrainResult:
+    if cancel_fn is not None:
+        cancel_fn()
     tokenizer_type, runtime_tts_model_type = _validate_model_pair(
         config.train_model_id,
         config.runtime_model_id,
@@ -214,6 +211,8 @@ def train_speaker_package(
         attn_implementation="flash_attention_2" if config.flash_attn else None,
         models_dir=config.models_dir,
     )
+    if cancel_fn is not None:
+        cancel_fn()
     if config.train_records is not None:
         train_records = list(config.train_records)
     elif config.train_jsonl is not None:
@@ -228,6 +227,8 @@ def train_speaker_package(
         shuffle=True,
         collate_fn=dataset.collate_fn,
     )
+    if cancel_fn is not None:
+        cancel_fn()
 
     initial_speaker_embedding = _load_initial_speaker_embedding(dataset, train_wrapper.model)
     trainer = SpeakerPackageTrainer(
@@ -252,7 +253,11 @@ def train_speaker_package(
 
     last_loss: Optional[float] = None
     for epoch in range(config.num_epochs):
+        if cancel_fn is not None:
+            cancel_fn()
         for step, batch in enumerate(dataloader):
+            if cancel_fn is not None:
+                cancel_fn()
             with accelerator.accumulate(trainer):
                 loss = trainer(batch)
                 accelerator.backward(loss)
@@ -265,12 +270,16 @@ def train_speaker_package(
             if log_fn is not None and step % 10 == 0:
                 log_fn(f"Epoch {epoch} | Step {step} | Loss: {last_loss:.4f}")
 
+    if cancel_fn is not None:
+        cancel_fn()
     accelerator.wait_for_everyone()
     unwrapped_trainer = accelerator.unwrap_model(trainer)
+    if cancel_fn is not None:
+        cancel_fn()
     package = save_voice_package(
         output_dir=config.output_dir,
         speaker=config.speaker_name,
-        base_model_id=config.runtime_model_id,
+        speak_model_id=config.runtime_model_id,
         tokenizer_type=tokenizer_type,
         tts_model_type=runtime_tts_model_type,
         speaker_embedding=unwrapped_trainer.speaker_embedding.detach().cpu(),
@@ -278,28 +287,19 @@ def train_speaker_package(
         slot_id=3000,
         lora_rank=config.lora_rank,
     )
-    _save_training_summary(
-        config.output_dir / "training_summary.json",
-        {
-            "speaker": config.speaker_name,
-            "trainModelId": config.train_model_id,
-            "runtimeModelId": config.runtime_model_id,
-            "tokenizerModelId": config.tokenizer_model_id,
-            "tokenizerType": tokenizer_type,
-            "ttsModelType": runtime_tts_model_type,
-            "numEpochs": config.num_epochs,
-            "batchSize": config.batch_size,
-            "lr": config.lr,
-            "lastLoss": last_loss,
-            "loraRank": config.lora_rank,
-        },
-    )
     if log_fn is not None:
-        log_fn(f"Exported speaker package: {package.root_dir}")
+        summary = "unknown" if last_loss is None else f"{last_loss:.4f}"
+        log_fn(
+            f"Exported speaker package: {package.root_dir} "
+            f"(slotId={package.config.slot_id}, loraRank={package.config.lora_rank}, lastLoss={summary})"
+        )
     return SpeakerPackageTrainResult(
         package_dir=package.root_dir,
         train_model_id=config.train_model_id,
         runtime_model_id=config.runtime_model_id,
         tokenizer_type=tokenizer_type,
         tts_model_type=runtime_tts_model_type,
+        slot_id=package.config.slot_id,
+        adapter_type=package.config.adapter_type,
+        lora_rank=package.config.lora_rank,
     )

@@ -138,46 +138,63 @@ If you want to run the API server from source, install the API dependencies as w
 pip install -e ".[runtime,api]"
 ```
 
-If you also want to use `POST /api/transcribe`, install the ASR dependencies:
+If you also want to use `POST /api/translate`, install the ASR dependencies:
 
 ```bash
 pip install -e ".[runtime,api,asr]"
 ```
 
-For the transcribe API, the project now prefers local ASR model directories under `./models/asr` when they exist:
+For the translate API, the project now prefers local ASR model directories under `./models/asr` when they exist:
 
 ```text
 ./models/asr/faster-whisper/<modelSize>
-./models/asr/funasr/<repo-name>
 ```
 
 Recommended manual download examples:
 
 ```bash
-# faster-whisper
+# faster-whisper medium (ModelScope)
+pip install -U modelscope
+modelscope download --model Systran/faster-whisper-medium \
+  --local_dir ./models/asr/faster-whisper/medium
+
+# faster-whisper medium (Hugging Face)
 pip install -U "huggingface_hub[cli]"
+huggingface-cli download Systran/faster-whisper-medium \
+  --local-dir ./models/asr/faster-whisper/medium
+
+# faster-whisper large-v2 (ModelScope)
+modelscope download --model Systran/faster-whisper-large-v2 \
+  --local_dir ./models/asr/faster-whisper/large-v2
+
+# faster-whisper large-v2 (Hugging Face)
+huggingface-cli download Systran/faster-whisper-large-v2 \
+  --local-dir ./models/asr/faster-whisper/large-v2
+
+# faster-whisper large-v3 (ModelScope)
+modelscope download --model Systran/faster-whisper-large-v3 \
+  --local_dir ./models/asr/faster-whisper/large-v3
+
+# faster-whisper large-v3 (Hugging Face)
 huggingface-cli download Systran/faster-whisper-large-v3 \
   --local-dir ./models/asr/faster-whisper/large-v3
 
-# FunASR Chinese
-pip install -U modelscope
-modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch \
-  --local_dir ./models/asr/funasr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
-modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch \
-  --local_dir ./models/asr/funasr/speech_fsmn_vad_zh-cn-16k-common-pytorch
-modelscope download --model iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch \
-  --local_dir ./models/asr/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch
-
-# FunASR Cantonese
-modelscope download --model iic/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online \
-  --local_dir ./models/asr/funasr/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online
+# faster-whisper large-v3-turbo (Hugging Face)
+huggingface-cli download Systran/faster-whisper-large-v3-turbo \
+  --local-dir ./models/asr/faster-whisper/large-v3-turbo
 ```
 
-The included launcher scripts (`start_api_mac.sh` and `start_api_windows.bat`) only use the project-local Conda environment at `./py312`. If you want to start the API through those scripts, create `py312` in the repository root, install a matching PyTorch build first, and then install `.[runtime,api]`. The scripts now ask whether to enable FlashAttention: choose `Y` to use it (and they will show the install command if `flash_attn` is missing), or choose `N` to start with `--no-flash-attn`.
+The included launcher scripts (`start_api_linux.sh` and `start_api_windows.bat`) only use the project-local Conda environment at `./py312`. If you want to start the API through those scripts, create `py312` in the repository root, install a matching PyTorch build first, and then install `.[runtime,api]`. The scripts ask whether to enable FlashAttention: choose `Y` to use it, or choose `N` to start with `--no-flash-attn`.
 
-The API now runs as a single process and uses the in-process GPU queue to absorb concurrent requests. `--max-gpu-queue-size` defaults to `2`, which means up to 2 waiting GPU jobs can be queued behind the active one.
+Device selection is platform-aware:
 
-The 25Hz tokenizer path requires `torchaudio`, which is intentionally not installed by default. If you need 25Hz tokenizer models, install a matching PyTorch + torchaudio build from the official PyTorch selector before using them.
+- CUDA is used on Linux/Windows/macOS when the current PyTorch build exposes CUDA devices.
+- MPS is only used on macOS when `torch.backends.mps` is available.
+- If neither CUDA nor MPS is available, startup asks whether to continue on CPU.
+
+The API now keeps the control plane in the main process and runs a main-process GPU queue. Each runtime request still gets a fresh worker process, and that worker exits when the request finishes so runtime resources are released between requests. `--max-gpu-queue-size` defaults to `2`, which means up to 2 waiting GPU jobs can be queued behind the active one.
+
+`torchaudio` is required by the 25Hz tokenizer path. Install a matching PyTorch + torchaudio build from the official PyTorch selector before using this feature.
 
 If API startup keeps the default `--flash-attn`, the server now fails fast when `flash_attn` is missing or broken and asks you to install it in the current environment instead of deferring that error until the first generation request.
 
@@ -450,7 +467,7 @@ qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-Base --ip 0.0.0.0 --port 8000
 
 On Windows, you can also use `start_demo_windows.bat`. It uses the project-local `./py312` environment, prefers the local `./models/Qwen3-TTS-12Hz-1.7B-Base` checkpoint if present, asks whether to enable FlashAttention, and defaults to `http://127.0.0.1:7860`.
 
-On macOS, you can also use `./start_demo_mac.sh`. It uses the project-local `./py312`, local model preference, default `http://127.0.0.1:7860`, and auto-selects `mps`/`cpu` when `--device` is not provided. If CUDA is unavailable, it automatically starts with `--no-flash-attn`.
+On Linux/macOS and other Unix-like systems, you can also use `./start_demo_linux.sh`. It uses the project-local `./py312`, local model preference, default `http://127.0.0.1:7860`, and auto-selects `cuda:N`, `mps`, or `cpu` with PyTorch when `--device` is not provided. If CUDA is unavailable, it automatically starts with `--no-flash-attn`.
 
 And then open `http://<your-ip>:8000`, or access it via port forwarding in tools like VS Code.
 

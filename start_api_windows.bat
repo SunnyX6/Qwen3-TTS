@@ -31,26 +31,16 @@ if exist "%ENV_DIR%\python.exe" (
   )
 
   if /I "!FLASH_MODE!"=="on" (
-    "%ENV_DIR%\python.exe" -c "import flash_attn" >nul 2>&1
-    set "FLASH_IMPORT_EXIT=!ERRORLEVEL!"
-    if not "!FLASH_IMPORT_EXIT!"=="0" (
-      echo `flash_attn` is not installed in "%ENV_DIR%". 1>&2
-      echo Install it in the current environment with: 1>&2
-      echo   "%ENV_DIR%\python.exe" -m pip install flash-attn --no-build-isolation 1>&2
-      echo If you do not want to install it, run this script again and choose N. 1>&2
-      set "EXIT_CODE=1"
-    ) else (
-      if "!FLASH_ARG_PRESENT!"=="0" set "FLASH_ARGS=--flash-attn"
-    )
+    if "!FLASH_ARG_PRESENT!"=="0" set "FLASH_ARGS=--flash-attn"
   ) else (
     if "!FLASH_ARG_PRESENT!"=="0" set "FLASH_ARGS=--no-flash-attn"
   )
 
   if "!EXIT_CODE!"=="0" (
     if defined FLASH_ARGS (
-      "%ENV_DIR%\python.exe" api\main.py !FLASH_ARGS! %*
+      "%ENV_DIR%\python.exe" main.py !FLASH_ARGS! %*
     ) else (
-      "%ENV_DIR%\python.exe" api\main.py %*
+      "%ENV_DIR%\python.exe" main.py %*
     )
     set "EXIT_CODE=!ERRORLEVEL!"
   )

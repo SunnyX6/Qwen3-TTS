@@ -1675,7 +1675,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 top_p=subtalker_top_p,
                 top_k=subtalker_top_k,
                 temperature=subtalker_temperature,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 return_dict_in_generate=True,
             )
             codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)

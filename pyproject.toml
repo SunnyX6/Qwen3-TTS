@@ -40,8 +40,6 @@ api = [
 ]
 asr = [
   "faster-whisper>=1,<2",
-  "funasr>=1,<2",
-  "modelscope>=1,<2",
 ]
 
 [project.urls]

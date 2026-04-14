@@ -10,7 +10,7 @@
 说明：
 
 - 具体职责代码拆分放在根目录 `api/` 下
-- 启动脚本直接运行 `api/main.py`
+- 启动脚本直接运行根目录 `main.py`
 - 不修改 `qwen_tts/` 下官方源码
 
 目标：
@@ -38,10 +38,14 @@
   - 调用 `Qwen3TTSModel.generate_custom_voice(...)`
 - `POST /api/trainVoice`
   - 基于用户上传的数据集执行单 speaker 微调
-  - 同一条 HTTP 连接以 `SSE` 持续返回训练状态
+  - 调用方必须通过 query 参数传 `requestId`
+  - 同一条 HTTP 连接会一直阻塞到训练终态，再返回单个 JSON
   - 训练成功后自动注册到当前 `CustomVoice` backbone 的音色库
-- `POST /api/transcribe`
-  - 独立的便利转录接口
+- `DELETE /api/trainVoice/{requestId}`
+  - 按 `requestId` 取消训练任务
+  - 若任务正在运行，请求会一直阻塞到取消清理完成，再返回单个 JSON
+- `POST /api/translate`
+  - 独立的语音转文本（ASR）接口
   - 不参与训练流程，只负责语音转文本
 - `GET /api/voices`
   - 列出当前 backbone 下可用的内置 speaker 和自定义 speaker
@@ -63,12 +67,11 @@ api/
   asr.py
   common.py
   config.py
-  device.py
   main.py
   runtime.py
   schemas.py
   service.py
-start_api_mac.sh
+start_api_linux.sh
 start_api_windows.bat
 models/
   asr/
@@ -77,11 +80,6 @@ models/
       large-v3-turbo/
       ...
     faster-whisper-cache/
-    funasr/
-      speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/
-      speech_fsmn_vad_zh-cn-16k-common-pytorch/
-      punc_ct-transformer_zh-cn-common-vocab272727-pytorch/
-      speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online/
 data/
   voices/
     index.json
@@ -98,7 +96,7 @@ data/
 - `voices/` 是已注册的自定义音色库，`index.json` 是注册索引
 - 训练日志只输出到 API 服务终端，不落盘保存为 `train.log`
 - 训练过程使用项目内 `data/train/tmp/` 工作目录，训练完成后会自动清理子目录
-- `models/asr/` 是转录接口的推荐本地模型目录
+- `models/asr/` 是语音转文本（ASR）接口的推荐本地模型目录
 - 若启动时传了 `--models-dir /your/path/models`，则 ASR 目录会变成 `/your/path/models/asr`
 
 ---
@@ -125,7 +123,7 @@ data/
 
 ### 3.3 音频字段
 
-`/api/clone`、`/api/trainVoice` 和 `/api/transcribe` 的音频输入统一使用 `multipart/form-data` 上传文件。
+`/api/clone`、`/api/trainVoice` 和 `/api/translate` 的音频输入统一使用 `multipart/form-data` 上传文件。
 
 服务端不再接收音频字段的本地路径、URL、`data:audio` 或原始 base64 字符串。
 
@@ -133,10 +131,15 @@ data/
 
 - `/api/clone`：`refAudio`（单文件）
 - `/api/trainVoice`：`refAudio`（单文件）、`sampleAudios`（多文件）、`sampleTexts`（与 `sampleAudios` 一一对应）
-- `/api/transcribe`：`audios`（多文件）
+- `/api/translate`：`audios`（多文件）
 - `/api/clone` 继续保留 `refText`
 
 训练接口会在服务端临时目录中使用这些上传音频，仅用于当前训练任务的数据准备阶段，不会持久化保存到 `data/` 目录。
+
+训练相关接口统一使用 `requestId` 作为调用方自定义任务标识：
+
+- `POST /api/trainVoice?requestId=...`
+- `DELETE /api/trainVoice/{requestId}`
 
 ### 3.4 公共生成参数
 
@@ -187,7 +190,7 @@ data/
 - 服务内部只有 **1 个 GPU worker**
 - 所有 GPU 任务都必须串行执行
 - GPU 任务包括：
-  - `/api/transcribe`
+  - `/api/translate`
   - `/api/voiceDesign`
   - `/api/clone`
   - `/api/customVoice`
@@ -212,16 +215,17 @@ data/
 
 ## 4. 接口设计
 
-## 4.1 `POST /api/transcribe`
+## 4.1 `POST /api/translate`
 
-独立的便利转录接口。
+独立的语音转文本（ASR）接口。
+
+说明：`translate` 是接口名，不代表“额外多一步流程”；音频转文本本身就是 ASR。
 
 请求类型：`multipart/form-data`
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/transcribe" \
+curl -X POST "http://127.0.0.1:8000/api/translate" \
   -F "language=Auto" \
-  -F "provider=auto" \
   -F "modelSize=large-v3" \
   -F "audios=@/path/to/a.wav" \
   -F "audios=@/path/to/b.wav"
@@ -230,13 +234,12 @@ curl -X POST "http://127.0.0.1:8000/api/transcribe" \
 请求字段：
 
 - `language`
-  - 可选值：`Auto`、`Chinese`、`Cantonese`、`English`、`Japanese`、`Korean`
-- `provider`
-  - 可选值：`auto`、`faster-whisper`、`funasr`
-  - 其中 `funasr` 只接受 `Chinese` 或 `Cantonese`
+  - 可选值（与 `qwen3-tts` 语言口径对齐）：`Auto`、`Chinese`、`English`、`Japanese`、`Korean`、`German`、`French`、`Russian`、`Portuguese`、`Spanish`、`Italian`、`Beijing_Dialect`、`Sichuan_Dialect`
+  - 服务端会自动映射到 ASR 语言码；`Beijing_Dialect` / `Sichuan_Dialect` 会映射为中文识别
 - `modelSize`
   - 当前用于 `faster-whisper`
-  - 可选值：`medium`、`medium.en`、`large-v2`、`large-v3`、`large-v3-turbo`
+  - 可选值：`medium`、`large-v2`、`large-v3`、`large-v3-turbo`
+  - 内部映射：当 `language=English` 且 `modelSize=medium` 时，服务端自动使用 `medium.en`
 - `audios`
   - 一个或多个上传音频文件
 
@@ -245,7 +248,6 @@ curl -X POST "http://127.0.0.1:8000/api/transcribe" \
 ```json
 {
   "ok": true,
-  "providerRequested": "auto",
   "languageRequested": "Auto",
   "modelSize": "large-v3",
   "total": 2,
@@ -259,7 +261,7 @@ curl -X POST "http://127.0.0.1:8000/api/transcribe" \
       "text": "额度耗尽，强制睡觉",
       "languageDetected": "Chinese",
       "languageCode": "zh",
-      "providerUsed": "funasr",
+      "providerUsed": "faster-whisper",
       "error": null
     },
     {
@@ -269,56 +271,67 @@ curl -X POST "http://127.0.0.1:8000/api/transcribe" \
       "text": "今天下午三点开会。",
       "languageDetected": "Chinese",
       "languageCode": "zh",
-      "providerUsed": "funasr",
+      "providerUsed": "faster-whisper",
       "error": null
     }
   ]
 }
 ```
 
+HTTP 状态码：
+
+- `200`：全部文件识别成功
+- `207`：部分成功、部分失败（失败详情在 `results[i].error`）
+- `422`：全部文件识别失败（请求字段合法，但批处理内全部失败）
+- `400`：请求参数校验失败（如 `language` / `modelSize` 不支持）
+- `404`：所需本地 ASR 模型目录不存在
+
 说明：
 
-- 该接口和训练接口没有耦合，只是独立的便利转录能力
+- 该接口和训练接口没有耦合，只是独立的语音转文本能力
 - 服务端在内存中解码音频，并统一转换到 `16kHz`
-- `provider=auto` 时，会优先做自动判断；识别到 `zh` / `yue` 时转到 `FunASR`
+- 服务端统一使用 `faster-whisper`
 - 单个文件失败不会拖垮整批请求，错误会落在对应 `results[i].error`
-- 当前实现会优先读取项目内本地目录；若本地目录不存在，则按上游库默认方式自动下载
+- 仅从本地模型目录加载，不做兜底自动下载
 
 本地模型目录约定：
 
 - `faster-whisper`
   - `<models-dir>/asr/faster-whisper/<modelSize>`
   - 例：`./models/asr/faster-whisper/large-v3`
-- `FunASR`
-  - `<models-dir>/asr/funasr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch`
-  - `<models-dir>/asr/funasr/speech_fsmn_vad_zh-cn-16k-common-pytorch`
-  - `<models-dir>/asr/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch`
-  - `<models-dir>/asr/funasr/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online`
 
 推荐手动下载命令：
 
 ```bash
-# faster-whisper large-v3
+# faster-whisper medium (ModelScope)
+pip install -U modelscope
+modelscope download --model Systran/faster-whisper-medium \
+  --local_dir ./models/asr/faster-whisper/medium
+
+# faster-whisper medium (Hugging Face)
 pip install -U "huggingface_hub[cli]"
+huggingface-cli download Systran/faster-whisper-medium \
+  --local-dir ./models/asr/faster-whisper/medium
+
+# faster-whisper large-v2 (ModelScope)
+modelscope download --model Systran/faster-whisper-large-v2 \
+  --local_dir ./models/asr/faster-whisper/large-v2
+
+# faster-whisper large-v2 (Hugging Face)
+huggingface-cli download Systran/faster-whisper-large-v2 \
+  --local-dir ./models/asr/faster-whisper/large-v2
+
+# faster-whisper large-v3 (ModelScope)
+modelscope download --model Systran/faster-whisper-large-v3 \
+  --local_dir ./models/asr/faster-whisper/large-v3
+
+# faster-whisper large-v3 (Hugging Face)
 huggingface-cli download Systran/faster-whisper-large-v3 \
   --local-dir ./models/asr/faster-whisper/large-v3
 
-# faster-whisper large-v3-turbo
+# faster-whisper large-v3-turbo (Hugging Face)
 huggingface-cli download Systran/faster-whisper-large-v3-turbo \
   --local-dir ./models/asr/faster-whisper/large-v3-turbo
-
-# FunASR Chinese ASR + VAD + PUNC
-pip install -U modelscope
-modelscope download --model iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch \
-  --local_dir ./models/asr/funasr/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
-modelscope download --model iic/speech_fsmn_vad_zh-cn-16k-common-pytorch \
-  --local_dir ./models/asr/funasr/speech_fsmn_vad_zh-cn-16k-common-pytorch
-modelscope download --model iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch \
-  --local_dir ./models/asr/funasr/punc_ct-transformer_zh-cn-common-vocab272727-pytorch
-
-# FunASR Cantonese
-modelscope download --model iic/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online \
-  --local_dir ./models/asr/funasr/speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online
 ```
 
 ---
@@ -441,7 +454,7 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
 请求类型：`multipart/form-data`
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
+curl -X POST "http://127.0.0.1:8000/api/trainVoice?requestId=user_001_train_20260414" \
   -F "modelId=Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
   -F "speakerName=user_001_voice" \
   -F "language=Chinese" \
@@ -457,38 +470,95 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice" \
 
 响应：
 
-响应类型：`text/event-stream`
+响应类型：`application/json`
 
-```text
-id: 2
-event: status
-data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"queued","speaker":"user_001_voice","voiceId":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+```json
+{
+  "ok": true,
+  "requestId": "user_001_train_20260414",
+  "taskId": "user_001_train_20260414",
+  "status": "completed",
+  "speaker": "user_001_voice",
+  "voiceId": "voice_20260412_113045_123456",
+  "baseModelId": "/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
+  "jobId": "trainVoice_20260412_113000_ef56ab78",
+  "queuePosition": 1,
+  "error": null
+}
+```
 
-id: 3
-event: status
-data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"running","speaker":"user_001_voice","voiceId":null,"baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+若训练过程中被另一条请求取消，则当前 `POST /api/trainVoice` 会返回终态：
 
-id: 4
-event: status
-data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed","speaker":"user_001_voice","voiceId":"voice_20260412_113045_123456","baseModelId":"models/Qwen3-TTS-12Hz-1.7B-Base","jobId":"trainVoice_20260412_113000_ef56ab78","queuePosition":1,"error":null}
+```json
+{
+  "ok": true,
+  "requestId": "user_001_train_20260414",
+  "taskId": "user_001_train_20260414",
+  "status": "canceled",
+  "speaker": "user_001_voice",
+  "voiceId": null,
+  "baseModelId": "/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
+  "jobId": "trainVoice_20260412_113000_ef56ab78",
+  "queuePosition": 1,
+  "error": null
+}
 ```
 
 说明：
 
 - 这里的训练是单 speaker 微调
+- `requestId` 为必填 query 参数，由调用方预先生成
 - 服务端固定使用 `Qwen/Qwen3-TTS-Tokenizer-12Hz`，调用方不需要也不能再传 `tokenizerModelId`
 - 当前训练数据仍然必须有文本
 - `sampleAudios` 和 `sampleTexts` 必须按顺序一一对应，数量必须一致
 - 训练使用服务启动时已经选定的设备，不在请求中单独传 `device`
 - 上传音频不会持久化保存到 `data/`，只在内存中解码和重采样
 - 训练进度日志只输出到 API 服务终端
-- 调用方需要按 `SSE` 流持续读取响应体，而不是等一个普通 JSON
-- 状态会按 `queued`、`running`、`completed` / `failed` / `rejected` 推进
-- 连接空闲时服务端会发送 `: keep-alive`
+- 该接口不会返回 `queued` / `running` 等中间态给调用方，只返回终态 JSON
+- 可能的终态包括：`completed`、`failed`、`canceled`
+- 若 `requestId` 已存在，服务会返回 `409 Conflict`
+- 若前端需要支持用户中途取消，必须在发起训练前先生成 `requestId`
 
 ---
 
-## 4.6 `GET /api/voices`
+## 4.6 `DELETE /api/trainVoice/{requestId}`
+
+取消训练任务。
+
+请求：
+
+```bash
+curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "requestId": "user_001_train_20260414",
+  "taskId": "user_001_train_20260414",
+  "status": "canceled",
+  "speaker": "user_001_voice",
+  "voiceId": null,
+  "baseModelId": "/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
+  "jobId": "trainVoice_20260412_113000_ef56ab78",
+  "queuePosition": 1,
+  "error": null
+}
+```
+
+说明：
+
+- 若任务仍在队列中，接口会很快返回 `canceled`
+- 若任务已经开始运行，接口会等待训练链路完成取消和清理，再返回终态 `canceled`
+- 若任务不存在，返回 `404`
+- 若任务已经 `completed` 或 `failed`，返回 `409`
+- 若重复取消同一个运行中的任务，后续 `DELETE` 也会等到同一个终态
+
+---
+
+## 4.7 `GET /api/voices`
 
 列出当前服务 `custom_voice_model_id` 对应 backbone 下可用的音色：
 
@@ -550,7 +620,7 @@ data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed",
 
 ---
 
-## 4.7 `DELETE /api/voices/{voiceId}`
+## 4.8 `DELETE /api/voices/{voiceId}`
 
 删除一个已注册的自定义音色。
 
@@ -582,9 +652,9 @@ data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed",
 
 其中：
 
-- `api/main.py` 负责 CLI、设备选择、启动打印、`uvicorn.run(...)`
-- `api/app.py` 负责 `FastAPI` 路由和异常处理
-- `api/asr.py` 负责转录模型调度和 provider 选择
+- 根目录 `main.py` 负责 CLI、设备选择、启动打印、`uvicorn.run(...)`
+- `api/server.py` 负责 `FastAPI` 路由和异常处理
+- `api/asr.py` 负责语音转文本模型调度和自动路由
 - `api/runtime.py` 负责模型缓存、队列、训练任务编排
 - `api/service.py` 负责接口业务逻辑
 - `api/schemas.py` 负责请求模型
@@ -602,26 +672,27 @@ data: {"ok":true,"taskId":"train_20260412_113000_ab12cd34","status":"completed",
 - 不生成 `train.log`
 - 成功后直接注册 voice package 到 `VoiceRegistry`
 
-## 5.3 推理做模型缓存
+## 5.3 请求级运行时进程
 
-服务可以缓存已经加载的 `modelId`，但必须受显存约束控制。
+服务默认在单次 GPU 请求完成后退出对应的运行时 worker，避免长期占用公共 GPU 资源。
+
+当前实现要求：
+
+- 推理和训练都使用 request-scoped worker
+- worker 只处理一个任务，任务完成立即退出
+- 模型、显存、解码缓冲和中间张量跟随 worker 一起释放
+- 不提供 keep-warm 模式，也不允许运行时资源常驻
+
+## 5.4 主进程控制面 + 单 GPU worker 串行执行
 
 推荐实现：
 
-- 默认只保留 1 个活动模型在显存中
-- 新模型加载前主动释放旧模型
-- 不允许多个模型长期同时常驻显存
-
-## 5.4 单 GPU worker 串行执行
-
-推荐实现：
-
-- 训练和推理共用 1 个 GPU worker
-- 所有 GPU 任务进入统一执行口
-- worker 一次只执行 1 个任务
+- 控制面留在主进程
+- 主进程内维护单 GPU 队列
+- 每个 GPU 请求启动独立 request-scoped worker
 - 队列达到上限时，新请求直接返回忙碌错误
 
-这样比“多个接口各自开线程直接跑 GPU”稳定得多。
+这样既保证了请求结束后 worker 退出、运行时资源被系统回收，也保证了主进程退出时不会再遗留额外中间进程。
 
 ## 5.5 草稿与正式库分离
 
@@ -662,13 +733,13 @@ Do you want to continue on CPU? [y/N]
 ## 6. 启动方式
 
 ```bash
-python api/main.py --host 0.0.0.0 --port 8000
+python main.py --host 0.0.0.0 --port 8000
 ```
 
 或者：
 
 ```bash
-./start_api_mac.sh --host 0.0.0.0 --port 8000
+./start_api_linux.sh --host 0.0.0.0 --port 8000
 ```
 
 Windows：
@@ -694,7 +765,7 @@ start_api_windows.bat --host 0.0.0.0 --port 8000
 pip install -e ".[runtime,api]"
 ```
 
-如果需要 `POST /api/transcribe`：
+如果需要 `POST /api/translate`：
 
 ```bash
 pip install -e ".[runtime,api,asr]"
@@ -704,7 +775,9 @@ pip install -e ".[runtime,api,asr]"
 
 > `--flash-attn` is enabled by default. If `flash_attn` is missing or broken, API startup now exits immediately with an installation hint instead of waiting until the first inference request fails.
 
-> The API runs as a single process. `--max-gpu-queue-size` defaults to `2`, which means at most 2 waiting GPU jobs can queue behind the currently running job.
+> The API keeps the control plane in the main process and serializes GPU work through a main-process queue. Runtime jobs still run in fresh worker processes and release runtime resources when each request finishes.
+
+> `--max-gpu-queue-size` defaults to `2`, which means at most 2 waiting GPU jobs can queue behind the currently running job.
 
 ### 6.1 启动时设备选择
 
@@ -712,7 +785,7 @@ pip install -e ".[runtime,api,asr]"
 
 - 如果用户未传 `--device`
   - 先自动探测 CUDA 设备
-  - 没有 CUDA 再尝试 MPS
+  - 没有 CUDA 再尝试 MPS（仅 macOS）
   - 都没有才弹终端确认 CPU
 - `--device` 默认值为 `auto`
 - 如果用户传了 `--device cuda:0`
@@ -783,7 +856,8 @@ Do you want to continue on CPU? [y/N]
 ## 7. 前端推荐流程
 
 1. 用户上传多段音频并填写文本
-2. 调 `POST /api/trainVoice`
-3. 持续读取同一个 `POST /api/trainVoice` 响应流中的 `SSE`
-4. 收到 `completed` 事件后，取返回里的 `speaker`
-5. 后续直接用该 `speaker` 调 `POST /api/customVoice`
+2. 前端先生成一个唯一的 `requestId`
+3. 调 `POST /api/trainVoice?requestId=...`
+4. 如用户中途取消，另开一条请求调 `DELETE /api/trainVoice/{requestId}`
+5. `POST /api/trainVoice` 返回 `completed` 后，取返回里的 `speaker`
+6. 后续直接用该 `speaker` 调 `POST /api/customVoice`

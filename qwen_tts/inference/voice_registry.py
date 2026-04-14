@@ -39,7 +39,8 @@ def _make_voice_id() -> str:
 class VoiceRecord:
     voice_id: str
     speaker: str
-    base_model_id: str
+    train_model_id: Optional[str]
+    speak_model_id: str
     path: str
     enabled: bool
     created_at: str
@@ -52,7 +53,12 @@ class VoiceRecord:
         return cls(
             voice_id=str(payload["voiceId"]),
             speaker=str(payload["speaker"]),
-            base_model_id=str(payload["baseModelId"]),
+            train_model_id=(
+                str(payload.get("trainModelId")).strip()
+                if payload.get("trainModelId") is not None
+                else None
+            ),
+            speak_model_id=str(payload["speakModelId"]),
             path=str(payload["path"]),
             enabled=bool(payload.get("enabled", True)),
             created_at=str(payload["createdAt"]),
@@ -66,7 +72,8 @@ class VoiceRecord:
         return {
             "voiceId": payload["voice_id"],
             "speaker": payload["speaker"],
-            "baseModelId": payload["base_model_id"],
+            "trainModelId": payload["train_model_id"],
+            "speakModelId": payload["speak_model_id"],
             "path": payload["path"],
             "enabled": payload["enabled"],
             "createdAt": payload["created_at"],
@@ -84,7 +91,7 @@ class VoiceRegistry:
         if not self.index_path.exists():
             _write_json_atomic(self.index_path, {"schemaVersion": 1, "voices": []})
 
-    def list(self, *, base_model_id: Optional[str] = None, enabled_only: bool = True) -> list[VoiceRecord]:
+    def list(self, *, speak_model_id: Optional[str] = None, enabled_only: bool = True) -> list[VoiceRecord]:
         with self._lock:
             index = self._load_index_locked()
         out: list[VoiceRecord] = []
@@ -92,7 +99,7 @@ class VoiceRegistry:
             record = VoiceRecord.from_payload(payload)
             if enabled_only and not record.enabled:
                 continue
-            if base_model_id is not None and record.base_model_id != base_model_id:
+            if speak_model_id is not None and record.speak_model_id != speak_model_id:
                 continue
             out.append(record)
         return out
@@ -104,15 +111,15 @@ class VoiceRegistry:
         with self._lock:
             return self._find_by_voice_id_locked(voice_id)
 
-    def find_by_speaker(self, speaker: str, *, base_model_id: Optional[str] = None) -> Optional[VoiceRecord]:
+    def find_by_speaker(self, speaker: str, *, speak_model_id: Optional[str] = None) -> Optional[VoiceRecord]:
         normalized = speaker.strip().lower()
         if not normalized:
             return None
         with self._lock:
-            return self._find_by_speaker_locked(normalized, base_model_id=base_model_id)
+            return self._find_by_speaker_locked(normalized, speak_model_id=speak_model_id)
 
-    def require_speaker(self, speaker: str, *, base_model_id: Optional[str] = None) -> VoiceRecord:
-        record = self.find_by_speaker(speaker, base_model_id=base_model_id)
+    def require_speaker(self, speaker: str, *, speak_model_id: Optional[str] = None) -> VoiceRecord:
+        record = self.find_by_speaker(speaker, speak_model_id=speak_model_id)
         if record is None:
             raise ValueError(f"Unknown custom speaker: {speaker}")
         return record
@@ -121,7 +128,7 @@ class VoiceRegistry:
         self,
         speaker: str,
         *,
-        base_model_id: Optional[str] = None,
+        speak_model_id: Optional[str] = None,
         builtin_speakers: Optional[Iterable[str]] = None,
     ) -> None:
         normalized = speaker.strip().lower()
@@ -131,7 +138,7 @@ class VoiceRegistry:
             builtin_set = {str(item).strip().lower() for item in builtin_speakers if str(item).strip()}
             if normalized in builtin_set:
                 raise ValueError(f"Speaker name already conflicts with built-in speaker: {speaker}")
-        existing = self.find_by_speaker(speaker, base_model_id=base_model_id)
+        existing = self.find_by_speaker(speaker, speak_model_id=speak_model_id)
         if existing is not None:
             raise ValueError(f"Speaker name already exists: {speaker}")
 
@@ -140,7 +147,8 @@ class VoiceRegistry:
         *,
         package_dir: Path,
         speaker: str,
-        base_model_id: str,
+        train_model_id: Optional[str],
+        speak_model_id: str,
         source_task_id: Optional[str],
         tokenizer_type: Optional[str],
         tts_model_type: Optional[str],
@@ -158,7 +166,7 @@ class VoiceRegistry:
                 builtin_set = {str(item).strip().lower() for item in builtin_speakers if str(item).strip()}
                 if normalized in builtin_set:
                     raise ValueError(f"Speaker name already conflicts with built-in speaker: {speaker}")
-            if self._find_by_speaker_locked(normalized, base_model_id=base_model_id) is not None:
+            if self._find_by_speaker_locked(normalized, speak_model_id=speak_model_id) is not None:
                 raise ValueError(f"Speaker name already exists: {speaker}")
             voice_id = _make_voice_id()
             target_dir = self.voices_dir / voice_id
@@ -166,7 +174,8 @@ class VoiceRegistry:
             record = VoiceRecord(
                 voice_id=voice_id,
                 speaker=speaker,
-                base_model_id=base_model_id,
+                train_model_id=(str(train_model_id).strip() if train_model_id is not None else None),
+                speak_model_id=speak_model_id,
                 path=str(target_dir),
                 enabled=True,
                 created_at=datetime.now().isoformat(),
@@ -177,7 +186,8 @@ class VoiceRegistry:
             meta_payload = {
                 "voiceId": record.voice_id,
                 "speaker": record.speaker,
-                "baseModelId": record.base_model_id,
+                "trainModelId": record.train_model_id,
+                "speakModelId": record.speak_model_id,
                 "path": record.path,
                 "enabled": record.enabled,
                 "createdAt": record.created_at,
@@ -234,13 +244,13 @@ class VoiceRegistry:
                 return record
         return None
 
-    def _find_by_speaker_locked(self, normalized_speaker: str, *, base_model_id: Optional[str]) -> Optional[VoiceRecord]:
+    def _find_by_speaker_locked(self, normalized_speaker: str, *, speak_model_id: Optional[str]) -> Optional[VoiceRecord]:
         index = self._load_index_locked()
         for payload in index["voices"]:
             record = VoiceRecord.from_payload(payload)
             if not record.enabled:
                 continue
-            if base_model_id is not None and record.base_model_id != base_model_id:
+            if speak_model_id is not None and record.speak_model_id != speak_model_id:
                 continue
             if record.speaker.strip().lower() == normalized_speaker:
                 return record

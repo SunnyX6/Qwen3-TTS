@@ -56,13 +56,6 @@ fi
 
 extra_args=()
 if [[ "${flash_mode}" == "on" ]]; then
-  if ! "${ENV_PYTHON}" -c "import flash_attn" >/dev/null 2>&1; then
-    echo "\`flash_attn\` is not installed in ${ENV_DIR}." >&2
-    echo "Install it in the current environment with:" >&2
-    echo "  \"${ENV_PYTHON}\" -m pip install flash-attn --no-build-isolation" >&2
-    echo "If you do not want to install it, run this script again and choose N." >&2
-    exit 1
-  fi
   if [[ "${flash_arg_present}" -eq 0 ]]; then
     extra_args+=(--flash-attn)
   fi
@@ -73,7 +66,7 @@ else
 fi
 
 if [[ "${#extra_args[@]}" -gt 0 ]]; then
-  exec "${ENV_PYTHON}" api/main.py "${extra_args[@]}" "$@"
+  exec "${ENV_PYTHON}" main.py "${extra_args[@]}" "$@"
 fi
 
-exec "${ENV_PYTHON}" api/main.py "$@"
+exec "${ENV_PYTHON}" main.py "$@"
