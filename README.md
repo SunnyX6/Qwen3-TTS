@@ -100,7 +100,7 @@ huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --local-dir ./mode
 huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base --local-dir ./models/Qwen3-TTS-12Hz-0.6B-Base
 ```
 
-When running from the project root, the loaders and API now prefer the local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if that folder exists; simple names like `Qwen3-TTS-12Hz-1.7B-Base` are also resolved from `./models` by default.
+When running from the project root, the Python loaders and demo CLI prefer the local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if that folder exists; simple names like `Qwen3-TTS-12Hz-1.7B-Base` are also resolved from `./models` by default. The FastAPI service is stricter: API requests still need the supported full official `modelId` values, but those ids are resolved against the local `./models/<model-leaf>` directories.
 
 
 ## Quickstart
@@ -467,9 +467,9 @@ qwen-tts-demo Qwen/Qwen3-TTS-12Hz-1.7B-Base --ip 0.0.0.0 --port 8000
 
 On Windows, you can also use `start_demo_windows.bat`. It uses the project-local `./py312` environment, prefers the local `./models/Qwen3-TTS-12Hz-1.7B-Base` checkpoint if present, asks whether to enable FlashAttention, and defaults to `http://127.0.0.1:7860`.
 
-On Linux/macOS and other Unix-like systems, you can also use `./start_demo_linux.sh`. It uses the project-local `./py312`, local model preference, default `http://127.0.0.1:7860`, and auto-selects `cuda:N`, `mps`, or `cpu` with PyTorch when `--device` is not provided. If CUDA is unavailable, it automatically starts with `--no-flash-attn`.
+On Linux/macOS and other Unix-like systems, you can also use `./start_demo_linux.sh`. It uses the project-local `./py312`, local model preference, default `http://127.0.0.1:7860`, and auto-selects `cuda:N`, `mps`, or `cpu` with PyTorch when `--device` is not provided. The script asks whether to enable FlashAttention; on non-CUDA machines choose `N` or pass `--no-flash-attn`.
 
-And then open `http://<your-ip>:8000`, or access it via port forwarding in tools like VS Code.
+If you run the explicit `qwen-tts-demo ... --port 8000` commands above, open `http://<your-ip>:8000`. If you use the launcher scripts, open their configured address instead; by default that is `http://127.0.0.1:7860`.
 
 #### Base Model HTTPS Notes
 

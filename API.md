@@ -9,7 +9,8 @@
 
 说明：
 
-- 具体职责代码拆分放在根目录 `api/` 下
+- HTTP 路由、请求模型和异常处理放在根目录 `api/` 下
+- 队列、运行时状态、任务执行和训练编排放在根目录 `runtime/` 下
 - 启动脚本直接运行根目录 `main.py`
 - 不修改 `qwen_tts/` 下官方源码
 
@@ -20,9 +21,10 @@
 - 保留官方 3 类推理能力
 - 增加“单 speaker 训练 -> 自动注册到音色库 -> 直接用于 customVoice”的产品流程
 - 默认所有数据都放在项目根目录下的 `data/` 中
-- 默认自动选择 1 张可用 GPU，并在整个服务生命周期内固定使用
+- 主进程只负责 API、队列、请求分发、统一 cancel
+- 训练/推理运行时、模型加载、设备解析都在 request-scoped 子进程内完成
 - 所有 GPU 任务串行执行，避免用户本机显存被并发请求打爆
-- 不自动降级到 CPU；若只能使用 CPU，必须在终端显式确认后才允许启动
+- `--device auto` 不会隐式降级到 CPU；若部署机器只能用 CPU，必须显式用 `--device cpu` 启动
 
 ---
 
@@ -32,28 +34,33 @@
 
 - `POST /api/voiceDesign`
   - 调用 `Qwen3TTSModel.generate_voice_design(...)`
+  - 调用方必须通过 query 参数传 `requestId`
 - `POST /api/clone`
   - 调用 `Qwen3TTSModel.generate_voice_clone(...)`
+  - 调用方必须通过 query 参数传 `requestId`
 - `POST /api/customVoice`
   - 调用 `Qwen3TTSModel.generate_custom_voice(...)`
+  - 调用方必须通过 query 参数传 `requestId`
 - `POST /api/trainVoice`
   - 基于用户上传的数据集执行单 speaker 微调
   - 调用方必须通过 query 参数传 `requestId`
   - 同一条 HTTP 连接会一直阻塞到训练终态，再返回单个 JSON
   - 训练成功后自动注册到当前 `CustomVoice` backbone 的音色库
-- `DELETE /api/trainVoice/{requestId}`
-  - 按 `requestId` 取消训练任务
-  - 若任务正在运行，请求会一直阻塞到取消清理完成，再返回单个 JSON
 - `POST /api/translate`
   - 独立的语音转文本（ASR）接口
   - 不参与训练流程，只负责语音转文本
+  - 调用方必须通过 query 参数传 `requestId`
+- `POST /api/cancel`
+  - 通用取消接口
+  - 请求体必须带 `kind` 和 `requestId`
+  - 若目标任务正在运行，请求会一直阻塞到对应 request-scoped worker 进程真正退出后再返回
 - `GET /api/voices`
   - 列出当前 backbone 下可用的内置 speaker 和自定义 speaker
 - `DELETE /api/voices/{voiceId}`
   - 删除一个已注册的自定义音色
 - `GET /api/healthz`
   - 健康检查
-  - 返回当前绑定设备和队列状态
+  - 返回主进程调度状态、队列状态和当前启动配置
 
 ---
 
@@ -62,15 +69,16 @@
 默认目录如下：
 
 ```text
+main.py
 api/
-  app.py
-  asr.py
-  common.py
-  config.py
-  main.py
-  runtime.py
+  exceptions.py
   schemas.py
-  service.py
+  server.py
+runtime/
+  catalog.py
+  executor.py
+  state.py
+  task.py
 start_api_linux.sh
 start_api_windows.bat
 models/
@@ -86,8 +94,6 @@ data/
     {voiceId}/
       model/
         speaker.safetensors
-        speaker_config.json
-      training_summary.json
       meta.json
 ```
 
@@ -105,17 +111,29 @@ data/
 
 ### 3.1 `modelId`
 
-内外统一使用 `modelId`。
+API 对 `modelId` 使用严格白名单，不接受任意本地路径或简写名。
 
-例子：
+当前支持的官方完整 id 如下：
 
-- `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
-- `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
-- `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-- `Qwen3-TTS-12Hz-1.7B-Base`
-- `data/voices/voice_xxx/model`
+- `POST /api/voiceDesign`
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
+- `POST /api/clone`
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
+  - `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
+- `POST /api/customVoice`
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
+  - `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
+- `POST /api/trainVoice`
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-Base`
+  - `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
+  - `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`
 
-> API and loaders now prefer the project-local `./models` directory. For example, `Qwen/Qwen3-TTS-12Hz-1.7B-Base` will first resolve to `./models/Qwen3-TTS-12Hz-1.7B-Base` if it exists, and simple names like `Qwen3-TTS-12Hz-1.7B-Base` are treated as `./models/Qwen3-TTS-12Hz-1.7B-Base` by default.
+解析规则：
+
+- API 会把这些官方完整 id 解析到本地 `./models/<model-leaf>` 目录
+- 对应目录必须已经存在且包含完整模型文件
+- Python loader 支持的简写名或任意本地路径并不是 API 的对外契约
 
 ### 3.2 `speaker`
 
@@ -136,10 +154,18 @@ data/
 
 训练接口会在服务端临时目录中使用这些上传音频，仅用于当前训练任务的数据准备阶段，不会持久化保存到 `data/` 目录。
 
-训练相关接口统一使用 `requestId` 作为调用方自定义任务标识：
+所有 GPU 重任务接口统一使用 `requestId` 作为调用方自定义任务标识：
 
+- `POST /api/translate?requestId=...`
+- `POST /api/voiceDesign?requestId=...`
+- `POST /api/clone?requestId=...`
+- `POST /api/customVoice?requestId=...`
 - `POST /api/trainVoice?requestId=...`
-- `DELETE /api/trainVoice/{requestId}`
+
+统一取消接口：
+
+- `POST /api/cancel`
+  - body: `{"kind":"translate|voiceDesign|clone|customVoice|trainVoice","requestId":"..."}`
 
 ### 3.4 公共生成参数
 
@@ -171,10 +197,11 @@ data/
 
 设备选择规则：
 
-- 服务启动时按 `CUDA > MPS > CPU确认` 的顺序选择设备
-- 默认自动选择 1 张 GPU
-- 整个服务生命周期内固定使用这 1 张 GPU
-- 所有训练和推理都共用这张 GPU
+- 服务启动时只接收 `--device` 配置，不在主进程里加载模型或初始化运行时
+- 每个 request-scoped 子进程启动时才真正解析设备并加载运行时
+- `--device auto` 会在子进程里按 `CUDA > MPS` 选择可用加速设备
+- 若没有可用 CUDA/MPS，则不会隐式进入 CPU 模式
+- CPU-only 部署必须显式用 `--device cpu` 启动，显式参数本身就是服务端确认
 - 不做运行中切卡
 
 如果用户显式通过启动参数指定 `--device cuda:1`，则优先使用该设备。
@@ -224,7 +251,7 @@ data/
 请求类型：`multipart/form-data`
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/translate" \
+curl -X POST "http://127.0.0.1:8000/api/translate?requestId=translate_20260415_001" \
   -F "language=Auto" \
   -F "modelSize=large-v3" \
   -F "audios=@/path/to/a.wav" \
@@ -357,6 +384,12 @@ huggingface-cli download Systran/faster-whisper-large-v3-turbo \
 }
 ```
 
+请求 URL：
+
+```text
+POST /api/voiceDesign?requestId=voice_design_20260415_001
+```
+
 返回：
 
 ```json
@@ -379,7 +412,7 @@ huggingface-cli download Systran/faster-whisper-large-v3-turbo \
 请求类型：`multipart/form-data`
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/api/clone" \
+curl -X POST "http://127.0.0.1:8000/api/clone?requestId=clone_20260415_001" \
   -F "modelId=Qwen/Qwen3-TTS-12Hz-1.7B-Base" \
   -F "text=欢迎来到我们的节目。" \
   -F "language=Chinese" \
@@ -423,6 +456,12 @@ curl -X POST "http://127.0.0.1:8000/api/clone" \
   "topP": 1.0,
   "repetitionPenalty": 1.05
 }
+```
+
+请求 URL：
+
+```text
+POST /api/customVoice?requestId=custom_voice_20260415_001
 ```
 
 说明：
@@ -480,27 +519,20 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice?requestId=user_001_train_2026
   "status": "completed",
   "speaker": "user_001_voice",
   "voiceId": "voice_20260412_113045_123456",
-  "baseModelId": "/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
-  "jobId": "trainVoice_20260412_113000_ef56ab78",
-  "queuePosition": 1,
+  "baseModelId": "/abs/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
   "error": null
 }
 ```
 
-若训练过程中被另一条请求取消，则当前 `POST /api/trainVoice` 会返回终态：
+若训练过程中被另一条请求取消，则当前 `POST /api/trainVoice` 会返回：
 
 ```json
 {
-  "ok": true,
+  "ok": false,
   "requestId": "user_001_train_20260414",
-  "taskId": "user_001_train_20260414",
   "status": "canceled",
-  "speaker": "user_001_voice",
-  "voiceId": null,
-  "baseModelId": "/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
-  "jobId": "trainVoice_20260412_113000_ef56ab78",
-  "queuePosition": 1,
-  "error": null
+  "kind": "trainVoice",
+  "error": "Canceled by request"
 }
 ```
 
@@ -511,24 +543,30 @@ curl -X POST "http://127.0.0.1:8000/api/trainVoice?requestId=user_001_train_2026
 - 服务端固定使用 `Qwen/Qwen3-TTS-Tokenizer-12Hz`，调用方不需要也不能再传 `tokenizerModelId`
 - 当前训练数据仍然必须有文本
 - `sampleAudios` 和 `sampleTexts` 必须按顺序一一对应，数量必须一致
-- 训练使用服务启动时已经选定的设备，不在请求中单独传 `device`
+- 训练使用服务启动时传入的 `--device` 策略，并在子进程里解析真实设备，不在请求中单独传 `device`
 - 上传音频不会持久化保存到 `data/`，只在内存中解码和重采样
 - 训练进度日志只输出到 API 服务终端
 - 该接口不会返回 `queued` / `running` 等中间态给调用方，只返回终态 JSON
 - 可能的终态包括：`completed`、`failed`、`canceled`
+- 成功响应稳定返回的训练结果字段为 `requestId`、`taskId`、`status`、`speaker`、`voiceId`、`baseModelId`、`error`
 - 若 `requestId` 已存在，服务会返回 `409 Conflict`
 - 若前端需要支持用户中途取消，必须在发起训练前先生成 `requestId`
 
 ---
 
-## 4.6 `DELETE /api/trainVoice/{requestId}`
+## 4.6 `POST /api/cancel`
 
-取消训练任务。
+统一取消接口。
 
 请求：
 
 ```bash
-curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
+curl -X POST "http://127.0.0.1:8000/api/cancel" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind": "trainVoice",
+    "requestId": "user_001_train_20260414"
+  }'
 ```
 
 响应：
@@ -537,24 +575,18 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
 {
   "ok": true,
   "requestId": "user_001_train_20260414",
-  "taskId": "user_001_train_20260414",
-  "status": "canceled",
-  "speaker": "user_001_voice",
-  "voiceId": null,
-  "baseModelId": "/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-Base",
-  "jobId": "trainVoice_20260412_113000_ef56ab78",
-  "queuePosition": 1,
-  "error": null
+  "kind": "trainVoice"
 }
 ```
 
 说明：
 
-- 若任务仍在队列中，接口会很快返回 `canceled`
-- 若任务已经开始运行，接口会等待训练链路完成取消和清理，再返回终态 `canceled`
+- `kind` 和 `requestId` 必须同时提供
+- 若任务仍在队列中，接口会直接移出队列后返回成功
+- 若任务已经开始运行，接口会等待对应 request-scoped worker 进程真正退出后再返回成功
 - 若任务不存在，返回 `404`
 - 若任务已经 `completed` 或 `failed`，返回 `409`
-- 若重复取消同一个运行中的任务，后续 `DELETE` 也会等到同一个终态
+- 若重复取消同一个运行中的任务，后续 `POST /api/cancel` 也会等到同一个终态
 
 ---
 
@@ -574,7 +606,9 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
     {
       "voiceId": "voice_20260402_xxxxxxxx",
       "speaker": "user_001_voice",
-      "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "baseModelId": "/abs/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+      "enabled": true,
+      "createdAt": "2026-04-02T10:20:30.000000",
       "supportedDialects": [
         "beijing_dialect",
         "sichuan_dialect"
@@ -586,7 +620,7 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
     {
       "voiceId": null,
       "speaker": "Serena",
-      "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "baseModelId": "/abs/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-CustomVoice",
       "enabled": true,
       "supportedDialects": [
         "beijing_dialect",
@@ -599,7 +633,7 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
     {
       "voiceId": null,
       "speaker": "Dylan",
-      "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base",
+      "baseModelId": "/abs/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-CustomVoice",
       "enabled": true,
       "supportedDialects": [
         "beijing_dialect",
@@ -617,6 +651,7 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
 
 - `supportedDialects` 表示当前 CustomVoice backbone 可接受的方言控制参数
 - `nativeDialect` 只表示该 speaker 的原生方言属性；训练出来的自定义 speaker 固定为 `null`
+- 返回里的 `baseModelId` 是历史字段名；当前实现里它实际表示该条音色绑定的 CustomVoice backbone 本地模型目录
 
 ---
 
@@ -631,7 +666,7 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
   "ok": true,
   "voiceId": "voice_20260412_102050_944573",
   "speaker": "user_001_voice",
-  "baseModelId": "models/Qwen3-TTS-12Hz-1.7B-Base"
+  "baseModelId": "/abs/path/to/Qwen3-TTS/models/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 }
 ```
 
@@ -647,17 +682,22 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
 - `uvicorn`
 - `threading`
 - `queue`
+- `multiprocessing`
 - `soundfile`
 - `librosa`
 
 其中：
 
-- 根目录 `main.py` 负责 CLI、设备选择、启动打印、`uvicorn.run(...)`
+- 根目录 `main.py` 负责 CLI、启动 `uvicorn`
+- `api/exceptions.py` 负责异常到 HTTP 响应的映射
 - `api/server.py` 负责 `FastAPI` 路由和异常处理
-- `api/asr.py` 负责语音转文本模型调度和自动路由
-- `api/runtime.py` 负责模型缓存、队列、训练任务编排
-- `api/service.py` 负责接口业务逻辑
 - `api/schemas.py` 负责请求模型
+- `runtime/catalog.py` 负责模型白名单和本地模型目录校验
+- `runtime/executor.py` 同时承担：
+  - 主进程控制面：队列、请求分发、统一 cancel
+  - 子进程任务入口：设备选择、GPU 初始化、模型加载、实际任务执行
+- `runtime/state.py` 负责 request-scoped 运行时状态
+- `runtime/task.py` 负责 ASR、推理、训练编排和 voice package 注册
 
 ## 5.2 训练由仓内模块编排
 
@@ -688,8 +728,9 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
 推荐实现：
 
 - 控制面留在主进程
-- 主进程内维护单 GPU 队列
+- 主进程只负责 API、内存队列、请求分发、统一 cancel
 - 每个 GPU 请求启动独立 request-scoped worker
+- 设备选择、`torch/cuda` 初始化、模型加载、训练和推理都只发生在子进程
 - 队列达到上限时，新请求直接返回忙碌错误
 
 这样既保证了请求结束后 worker 退出、运行时资源被系统回收，也保证了主进程退出时不会再遗留额外中间进程。
@@ -700,33 +741,23 @@ curl -X DELETE "http://127.0.0.1:8000/api/trainVoice/user_001_train_20260414"
 - 训练过程只使用项目内 `data/train/tmp/` 工作目录，任务结束后自动清理
 - 训练成功后服务端直接完成注册，不存在单独的 `deployVoice` 保存步骤
 
-## 5.6 禁止自动降级到 CPU
+## 5.6 禁止隐式降级到 CPU
 
 默认策略：
 
-- 如果发现可用 CUDA 设备，则正常启动
-- 如果没有 CUDA 但有 MPS，则使用 MPS 正常启动
-- 如果既没有 CUDA 也没有 MPS，则 **不自动切到 CPU**
+- 如果启动参数是 `--device auto`
+  - 子进程请求运行时优先尝试 CUDA
+  - 没有 CUDA 再尝试 MPS
+  - 如果既没有 CUDA 也没有 MPS，则 **不会隐式切到 CPU**
+- 如果部署方明确接受 CPU 模式，必须显式使用 `--device cpu`
 
-必须在启动终端中给出明确提示：
+原因：
 
-```text
-No CUDA or MPS device detected.
-Running Qwen3-TTS on CPU will be very slow.
-Do you want to continue on CPU? [y/N]
-```
+- 当前架构里主进程只是控制面，不负责运行时初始化
+- 模型加载、设备解析、训练/推理都在 request-scoped 子进程里完成
+- 所以 CPU 模式必须体现在明确的启动参数里，而不是靠子进程里的交互式确认
 
-只有用户输入以下任一值才允许继续启动：
-
-- `y`
-- `yes`
-
-其他输入或直接回车：
-
-- 终止启动
-- 返回非 0 退出码
-
-这样可以避免用户在不知情的情况下进入极慢的 CPU 模式。
+这样可以避免服务在 `--device auto` 下悄悄掉到极慢的 CPU 模式。
 
 ---
 
@@ -734,6 +765,12 @@ Do you want to continue on CPU? [y/N]
 
 ```bash
 python main.py --host 0.0.0.0 --port 8000
+```
+
+如果机器只能跑 CPU：
+
+```bash
+python main.py --host 0.0.0.0 --port 8000 --device cpu --no-flash-attn
 ```
 
 或者：
@@ -775,7 +812,7 @@ pip install -e ".[runtime,api,asr]"
 
 > `--flash-attn` is enabled by default. If `flash_attn` is missing or broken, API startup now exits immediately with an installation hint instead of waiting until the first inference request fails.
 
-> The API keeps the control plane in the main process and serializes GPU work through a main-process queue. Runtime jobs still run in fresh worker processes and release runtime resources when each request finishes.
+> The API keeps the control plane in the main process and serializes GPU work through a main-process queue. Runtime jobs run in fresh request-scoped child processes and release runtime resources when each request finishes.
 
 > `--max-gpu-queue-size` defaults to `2`, which means at most 2 waiting GPU jobs can queue behind the currently running job.
 
@@ -784,52 +821,32 @@ pip install -e ".[runtime,api,asr]"
 推荐行为：
 
 - 如果用户未传 `--device`
-  - 先自动探测 CUDA 设备
+  - 主进程只记录 `--device=auto`
+  - 子进程在真正执行请求时先探测 CUDA
   - 没有 CUDA 再尝试 MPS（仅 macOS）
-  - 都没有才弹终端确认 CPU
+  - 都没有则请求直接失败，不会隐式切到 CPU
 - `--device` 默认值为 `auto`
 - 如果用户传了 `--device cuda:0`
-  - 使用该设备
+  - 子进程固定使用该设备
 - 如果用户传了 `--device mps`
-  - 使用 MPS
+  - 子进程固定使用 MPS
 - 如果用户传了 `--device cpu`
-  - 仍然需要终端二次确认
+  - 视为显式接受 CPU 模式
+  - 子进程直接使用 CPU，不再做交互式确认
 
 ### 6.2 启动时终端输出
 
-服务启动时必须在终端直接打印当前运行设备信息，不能让用户猜。
+主进程只负责控制面，所以启动日志不保证提前打印“最终运行设备”。
 
 示例：
 
 ```text
 Qwen3-TTS API starting...
-Device mode: CUDA
-Selected device: cuda:0
-Device name: NVIDIA GeForce RTX 4090
 Data dir: /path/to/Qwen3-TTS/data
 API listening on http://0.0.0.0:8000/api
 ```
 
-如果当前走 MPS：
-
-```text
-Qwen3-TTS API starting...
-Device mode: MPS
-Selected device: mps
-Device name: Apple M2
-Data dir: /path/to/Qwen3-TTS/data
-API listening on http://0.0.0.0:8000/api
-```
-
-如果既没有 CUDA 也没有 MPS：
-
-```text
-No CUDA or MPS device detected.
-Running Qwen3-TTS on CPU will be very slow.
-Do you want to continue on CPU? [y/N]
-```
-
-只有用户输入 `y` 或 `yes` 才继续启动。
+如果需要强制 CPU 模式，应该在启动命令里显式传 `--device cpu --no-flash-attn`，而不是等待服务在请求期内弹交互提示。
 
 ### 6.3 服务状态接口建议
 
@@ -839,17 +856,26 @@ Do you want to continue on CPU? [y/N]
 {
   "ok": true,
   "status": "healthy",
-  "selectedDevice": "cuda:0",
-  "deviceName": "NVIDIA GeForce RTX 4090",
+  "selectedDevice": "auto",
+  "deviceMode": "",
+  "deviceName": "",
   "queueStatus": {
-    "running": 1,
-    "queued": 0
+    "activeJob": null,
+    "queuedCount": 0,
+    "queuedJobs": []
   },
+  "runtimePolicy": "executor-queue+single-request-child-process",
   "dataDir": "/path/to/Qwen3-TTS/data",
   "modelsDir": "/path/to/Qwen3-TTS/models",
   "asrModelsDir": "/path/to/Qwen3-TTS/models/asr"
 }
 ```
+
+说明：
+
+- `selectedDevice` 是服务启动时传入的 `--device` 配置
+- 主进程不解析运行时设备，所以 `deviceMode` / `deviceName` 在 `--device auto` 下可能为空
+- 真实执行设备由每个请求对应的子进程在运行时解析
 
 ---
 
@@ -858,6 +884,8 @@ Do you want to continue on CPU? [y/N]
 1. 用户上传多段音频并填写文本
 2. 前端先生成一个唯一的 `requestId`
 3. 调 `POST /api/trainVoice?requestId=...`
-4. 如用户中途取消，另开一条请求调 `DELETE /api/trainVoice/{requestId}`
-5. `POST /api/trainVoice` 返回 `completed` 后，取返回里的 `speaker`
-6. 后续直接用该 `speaker` 调 `POST /api/customVoice`
+4. 如用户中途取消，另开一条请求调 `POST /api/cancel`
+5. `POST /api/cancel` body 传：
+   `{"kind":"trainVoice","requestId":"..."}`
+6. `POST /api/trainVoice` 返回 `completed` 后，取返回里的 `speaker`
+7. 后续直接用该 `speaker` 调 `POST /api/customVoice?requestId=...`

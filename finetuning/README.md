@@ -1,10 +1,28 @@
 ## Fine Tuning Qwen3-TTS-12Hz-1.7B/0.6B-Base
 
-The Qwen3-TTS-12Hz-1.7B/0.6B-Base model series currently supports single-speaker fine-tuning. Please run `pip install qwen-tts` first, then run the command below:
+The Qwen3-TTS-12Hz-1.7B/0.6B-Base model series currently supports single-speaker fine-tuning. Before running the scripts below, install a matching PyTorch build for your machine and install the fine-tuning runtime dependencies:
+
+```bash
+pip install -U qwen-tts accelerate
+```
+
+Then clone the repository:
+
+```bash
+git clone https://github.com/QwenLM/Qwen3-TTS.git
+cd Qwen3-TTS
+```
+
+If you prefer a source install inside the cloned repository, you can instead run:
+
+```bash
+pip install -e ".[runtime]"
+```
+
+Then enter the fine-tuning directory:
 
 ```
-git clone https://github.com/QwenLM/Qwen3-TTS.git
-cd Qwen3-TTS/finetuning
+cd finetuning
 ```
 
 Then follow the steps below to complete the entire fine-tuning workflow. Multi-speaker fine-tuning and other advanced fine-tuning features will be supported in future releases.
