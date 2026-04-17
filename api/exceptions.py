@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from runtime.executor import ConflictError, QueueFullError
+from runtime.executor import ConflictError, QueueFullError, RequestCanceledError
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -28,6 +28,21 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConflictError)
     async def conflict_error(_: Request, exc: ConflictError):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+    @app.exception_handler(RequestCanceledError)
+    async def request_canceled(_: Request, exc: RequestCanceledError):
+        payload = {
+            "ok": False,
+            "status": "canceled",
+            "error": str(exc),
+        }
+        request_id = getattr(exc, "request_id", None)
+        if request_id:
+            payload["requestId"] = request_id
+        kind = getattr(exc, "kind", None)
+        if kind:
+            payload["kind"] = kind
+        return JSONResponse(payload, status_code=409)
 
     @app.exception_handler(FileNotFoundError)
     async def file_not_found(_: Request, exc: FileNotFoundError):

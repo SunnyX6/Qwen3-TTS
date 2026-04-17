@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 from qwen_tts.inference.voice_registry import VoiceRegistry
 
-from runtime.catalog import require_model_ref, resolve_model_ref
+from runtime.catalog import resolve_model_ref
 from runtime.task import AsrManager
 
 _RESOURCE_TRACKER_LOCK = threading.RLock()
@@ -264,11 +264,6 @@ class AppState:
         self.config = config
         _ensure_dir(config.data_dir)
         _ensure_dir(config.models_dir)
-        require_model_ref(
-            config.custom_voice_model_id,
-            models_dir=config.models_dir,
-            field_name="custom_voice_model_id",
-        )
         self.voice_registry = VoiceRegistry(_ensure_dir(config.data_dir / "voices"))
         self.models = ModelManager(
             config.device,

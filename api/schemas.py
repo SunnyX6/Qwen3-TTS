@@ -53,8 +53,7 @@ class VoiceDesignRequest(ModelBoundAudioRequestModel):
     instruct: str
 
 
-class CustomVoiceRequest(AudioRequestModel):
-    modelId: Optional[str] = None
+class CustomVoiceRequest(ModelBoundAudioRequestModel):
     speaker: str
     instruct: Optional[str] = None
     dialect: Optional[str] = None
@@ -224,3 +223,8 @@ class TranscribeRequest:
                 }
             )
         return payload
+
+
+class CancelRequest(BaseRequestModel):
+    requestId: str = Field(min_length=1)
+    kind: Literal["translate", "voiceDesign", "clone", "customVoice", "trainVoice"]

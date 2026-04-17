@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -14,26 +13,18 @@ from qwen_tts.inference.voice_registry import VoiceRegistry
 
 from api.exceptions import register_exception_handlers
 from api.schemas import (
+    CancelRequest,
     CloneRequest,
     CustomVoiceRequest,
     TrainVoiceRequest,
     TranscribeRequest,
     VoiceDesignRequest,
 )
-from runtime.catalog import (
-    BASE_MODEL_IDS,
-    CUSTOM_VOICE_MODEL_IDS,
-    VOICE_DESIGN_MODEL_IDS,
-    require_model_ref,
-    require_supported_model_id,
-)
+from runtime.catalog import CUSTOM_VOICE_MODEL_IDS, require_model_ref, require_supported_model_id
 from runtime.executor import Executor
 from runtime.task import (
     PreparedAudioResponse,
-    get_builtin_speakers_for_base_model,
     list_available_voices,
-    resolve_public_base_model_id,
-    resolve_train_model_pair,
 )
 
 
@@ -135,21 +126,19 @@ def create_server(config: Any) -> FastAPI:
             "deviceName": config.device_name,
             "processPid": os.getpid(),
             "queueStatus": executor.snapshot(),
-            "runtimePolicy": "executor-queue+single-process-task-thread",
+            "runtimePolicy": "executor-queue+single-request-child-process",
             "dataDir": str(config.data_dir.resolve()),
             "modelsDir": str(config.models_dir.resolve()),
             "asrModelsDir": str((config.models_dir / "asr").resolve()),
-            "customVoiceModelId": config.custom_voice_model_id,
         }
 
     @app.get(f"{api_prefix}/voices")
-    def voices(modelId: str | None = None):
-        requested_model_id = config.custom_voice_model_id if modelId is None else modelId
+    def voices(speak_model_id: str = Query(..., min_length=1)):
         _, resolved_model_ref = _require_model(
             config,
-            requested_model_id,
+            speak_model_id,
             supported_model_ids=CUSTOM_VOICE_MODEL_IDS,
-            field_name="modelId",
+            field_name="speak_model_id",
         )
         return {
             "ok": True,
@@ -161,15 +150,19 @@ def create_server(config: Any) -> FastAPI:
         }
 
     @app.post(f"{api_prefix}/translate")
-    async def translate(request: TranscribeRequest = Depends(TranscribeRequest.as_form)):
+    async def translate(
+        request: TranscribeRequest = Depends(TranscribeRequest.as_form),
+        requestId: str = Query(..., min_length=1),
+    ):
         payload = await request.to_payload()
         audio_payloads = payload.get("audios")
         if not isinstance(audio_payloads, list) or not audio_payloads:
             raise ValueError("`audios` must be a non-empty list")
         result = await asyncio.to_thread(
-            executor.run,
-            "transcribe",
+            executor.run_request,
+            "translate",
             payload,
+            request_id=str(requestId).strip(),
             meta={
                 "audioCount": len(audio_payloads),
                 "language": str(payload.get("language", "Auto") or "Auto"),
@@ -179,55 +172,49 @@ def create_server(config: Any) -> FastAPI:
         return JSONResponse(response_payload, status_code=_resolve_transcribe_status_code(response_payload))
 
     @app.post(f"{api_prefix}/voiceDesign")
-    def voice_design(request: VoiceDesignRequest):
+    def voice_design(
+        request: VoiceDesignRequest,
+        requestId: str = Query(..., min_length=1),
+    ):
         payload = request.model_dump(exclude_none=True)
-        model_id, _ = _require_model(
-            config,
-            payload["modelId"],
-            supported_model_ids=VOICE_DESIGN_MODEL_IDS,
-            field_name="modelId",
-        )
-        result = executor.run(
+        result = executor.run_request(
             "voiceDesign",
             payload,
-            meta={"modelId": model_id, "seed": int(payload.get("seed", 0))},
+            request_id=str(requestId).strip(),
+            meta={"modelId": str(payload.get("modelId") or ""), "seed": int(payload.get("seed", 0))},
         )
         return _build_audio_response(_deserialize_audio_response(dict(result or {})))
 
     @app.post(f"{api_prefix}/clone")
-    async def clone(request: CloneRequest = Depends(CloneRequest.as_form)):
+    async def clone(
+        request: CloneRequest = Depends(CloneRequest.as_form),
+        requestId: str = Query(..., min_length=1),
+    ):
         payload = await request.to_payload()
-        model_id, _ = _require_model(
-            config,
-            payload["modelId"],
-            supported_model_ids=BASE_MODEL_IDS,
-            field_name="modelId",
-        )
         result = await asyncio.to_thread(
-            executor.run,
+            executor.run_request,
             "clone",
             payload,
-            meta={"modelId": model_id, "seed": int(payload.get("seed", 0))},
+            request_id=str(requestId).strip(),
+            meta={"modelId": str(payload.get("modelId") or ""), "seed": int(payload.get("seed", 0))},
         )
         return _build_audio_response(_deserialize_audio_response(dict(result or {})))
 
     @app.post(f"{api_prefix}/customVoice")
-    def custom_voice(request: CustomVoiceRequest):
+    def custom_voice(
+        request: CustomVoiceRequest,
+        requestId: str = Query(..., min_length=1),
+    ):
         payload = request.model_dump(exclude_none=True)
         requested_speaker = (payload.get("speaker") or "").strip()
         if not requested_speaker:
             raise ValueError("`speaker` is required")
-        runtime_model_id, _ = _require_model(
-            config,
-            str(payload.get("modelId") or config.custom_voice_model_id).strip(),
-            supported_model_ids=CUSTOM_VOICE_MODEL_IDS,
-            field_name="modelId",
-        )
-        result = executor.run(
+        result = executor.run_request(
             "customVoice",
             payload,
+            request_id=str(requestId).strip(),
             meta={
-                "modelId": runtime_model_id,
+                "modelId": str(payload["modelId"]).strip(),
                 "speaker": requested_speaker,
                 "seed": int(payload.get("seed", 0)),
             },
@@ -254,54 +241,34 @@ def create_server(config: Any) -> FastAPI:
             if not sample["audioBytes"]:
                 raise ValueError("Sample audio file is empty")
 
-        _, resolved_runtime_model_id = resolve_train_model_pair(
-            payload["modelId"],
-            config.models_dir,
-        )
-        resolved_train_model_id = resolve_public_base_model_id(
-            payload["modelId"],
-            config.models_dir,
-        )
-        builtin_speakers = get_builtin_speakers_for_base_model(
-            config.models_dir,
-            resolved_runtime_model_id,
-        )
-        voice_registry.assert_speaker_available(
-            payload["speakerName"],
-            speak_model_id=resolved_runtime_model_id,
-            builtin_speakers=builtin_speakers,
-        )
-
         task_id = str(requestId).strip()
         if not task_id:
             raise ValueError("`requestId` is required")
-        queued_meta = {
-            "taskId": task_id,
-            "requestId": task_id,
-            "status": "queued",
-            "speaker": payload["speakerName"],
-            "trainModelId": resolved_train_model_id,
-            "speakModelId": resolved_runtime_model_id,
-            "createdAt": datetime.now().isoformat(),
-            "updatedAt": datetime.now().isoformat(),
-        }
         result = await asyncio.to_thread(
-            executor.run_train,
-            task_id=task_id,
-            payload={**payload, "taskId": task_id, "requestId": task_id},
-            meta={"taskId": task_id, "requestId": task_id, "speaker": payload["speakerName"]},
-            initial_meta=queued_meta,
+            executor.run_request,
+            "trainVoice",
+            payload,
+            request_id=task_id,
+            meta={"speaker": payload["speakerName"], "modelId": str(payload.get("modelId") or "")},
         )
         return JSONResponse(_build_train_status_payload(task_id, dict(result or {})))
 
-    @app.delete(f"{api_prefix}/trainVoice/{{request_id}}")
-    def cancel_train_voice(request_id: str):
-        task_id = str(request_id).strip()
-        if not task_id:
+    @app.post(f"{api_prefix}/cancel")
+    def cancel_request(request: CancelRequest):
+        request_id = str(request.requestId).strip()
+        kind = str(request.kind).strip()
+        if not request_id:
             raise ValueError("`requestId` is required")
-        result = executor.cancel_train(task_id)
-        payload = _build_train_status_payload(task_id, dict(result or {}))
-        return JSONResponse(payload)
+        if not kind:
+            raise ValueError("`kind` is required")
+        result = executor.cancel_request(request_id, kind=kind)
+        return JSONResponse(
+            {
+                "ok": True,
+                "requestId": str(result.get("requestId") or request_id),
+                "kind": str(result.get("kind") or kind),
+            }
+        )
 
     @app.delete(f"{api_prefix}/voices/{{voice_id}}")
     def delete_voice(voice_id: str):

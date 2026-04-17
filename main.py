@@ -5,8 +5,6 @@ import os
 from pathlib import Path
 from types import FrameType, SimpleNamespace
 
-from runtime.catalog import CUSTOM_VOICE_MODEL_IDS
-
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
 DEFAULT_MODELS_DIR = ROOT_DIR / "models"
@@ -24,11 +22,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models-dir", default=str(DEFAULT_MODELS_DIR))
     parser.add_argument("--max-gpu-queue-size", type=int, default=2)
     parser.add_argument("--timeout-graceful-shutdown", type=int, default=DEFAULT_TIMEOUT_GRACEFUL_SHUTDOWN)
-    parser.add_argument(
-        "--custom-voice-model-id",
-        default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-        choices=CUSTOM_VOICE_MODEL_IDS,
-    )
     return parser
 
 
@@ -48,7 +41,6 @@ def main() -> int:
         data_dir=Path(args.data_dir).resolve(),
         models_dir=Path(args.models_dir).resolve(),
         max_gpu_queue_size=int(args.max_gpu_queue_size),
-        custom_voice_model_id=str(args.custom_voice_model_id),
     )
 
     import uvicorn

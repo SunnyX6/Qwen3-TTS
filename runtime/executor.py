@@ -1,21 +1,18 @@
 from __future__ import annotations
 
 import builtins
+import multiprocessing as mp
 import queue
+import signal
 import threading
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from qwen_tts.device import (
-    get_cpu_confirmation_reason,
-    get_flash_attn_validation_errors,
-    resolve_device,
-)
-
-from runtime.catalog import require_model_ref
+_CANCEL_TERMINATE_TIMEOUT_SECONDS = 2.0
 
 
 class QueueFullError(RuntimeError):
@@ -26,9 +23,27 @@ class ConflictError(RuntimeError):
     pass
 
 
-def _ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+class RequestCanceledError(RuntimeError):
+    def __init__(self, message: str, *, request_id: str | None = None, kind: str | None = None):
+        super().__init__(message)
+        self.request_id = request_id
+        self.kind = kind
+
+
+class RequestNotFoundError(FileNotFoundError):
+    pass
+
+
+class ChildResultUnavailableError(RuntimeError):
+    pass
+
+
+class ChildExitedDuringCancelError(RuntimeError):
+    pass
+
+
+class ChildProcessCanceledError(BaseException):
+    pass
 
 
 def _make_job_id(kind: str) -> str:
@@ -36,37 +51,20 @@ def _make_job_id(kind: str) -> str:
     return f"{kind}_{timestamp}_{uuid.uuid4().hex[:8]}"
 
 
-def _raise_runtime_error(error: Dict[str, Any]) -> None:
-    error_type = str(error.get("type") or "RuntimeError")
-    message = str(error.get("message") or "RuntimeError")
-    if error_type == "QueueFullError":
-        raise QueueFullError(message)
-    if error_type == "ConflictError":
-        raise ConflictError(message)
-    exc_cls = getattr(builtins, error_type, None)
-    if isinstance(exc_cls, type) and issubclass(exc_cls, BaseException):
-        raise exc_cls(message)
-    raise RuntimeError(f"{error_type}: {message}")
+def _request_key(kind: str, request_id: str) -> tuple[str, str]:
+    return str(kind).strip(), str(request_id).strip()
 
 
-def _queued_snapshot_entry(job: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "jobId": job["jobId"],
-        "kind": job["kind"],
-        "createdAt": job["createdAt"],
-        "meta": dict(job.get("meta") or {}),
-    }
+def _handle_sigterm(signum, frame):
+    raise ChildProcessCanceledError("Canceled by request")
 
 
-def _make_snapshot(active_job: Optional[Dict[str, Any]], pending_jobs: deque[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
-        "activeJob": dict(active_job) if active_job is not None else None,
-        "queuedCount": len(pending_jobs),
-        "queuedJobs": [_queued_snapshot_entry(job) for job in pending_jobs],
-    }
+def _ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def _confirm_cpu_startup(reason: Optional[str] = None) -> bool:
+def _confirm_cpu_startup(reason: str | None = None) -> bool:
     if reason:
         print(reason, flush=True)
     print("Running Qwen3-TTS on CPU will be very slow.", flush=True)
@@ -78,7 +76,17 @@ def _confirm_cpu_startup(reason: Optional[str] = None) -> bool:
     return answer in ("y", "yes")
 
 
-def _prepare_config(config: Any) -> Any:
+def _build_runtime_config(config_payload: Dict[str, Any]) -> Any:
+    from qwen_tts.device import (
+        get_cpu_confirmation_reason,
+        get_flash_attn_validation_errors,
+        resolve_device,
+    )
+
+    config = SimpleNamespace(**dict(config_payload))
+    config.data_dir = Path(config.data_dir).resolve()
+    config.models_dir = Path(config.models_dir).resolve()
+
     resolved = resolve_device(str(config.device), set_cuda_device=True)
     flash_errors = get_flash_attn_validation_errors(
         enabled=bool(config.flash_attn),
@@ -87,37 +95,153 @@ def _prepare_config(config: Any) -> Any:
     if flash_errors:
         raise RuntimeError("; ".join(flash_errors))
     reason = get_cpu_confirmation_reason(str(config.device), resolved)
-    if reason and not _confirm_cpu_startup(reason):
+    cpu_confirmed = bool(getattr(config, "cpu_confirmed", False))
+    if reason and not cpu_confirmed and not _confirm_cpu_startup(reason):
         raise RuntimeError("CPU startup was not confirmed")
 
     config.device = resolved.device
     config.device_mode = resolved.device_mode
     config.device_name = resolved.device_name
+    config.cpu_confirmed = cpu_confirmed or resolved.device == "cpu"
     config.keep_warm = False
-    config.data_dir = Path(config.data_dir).resolve()
-    config.models_dir = Path(config.models_dir).resolve()
     _ensure_dir(config.data_dir)
     _ensure_dir(config.models_dir)
-    require_model_ref(
-        str(config.custom_voice_model_id),
-        models_dir=config.models_dir,
-        field_name="custom_voice_model_id",
-    )
     return config
+
+
+def run_child_task(
+    config_payload: Dict[str, Any],
+    kind: str,
+    payload: Dict[str, Any],
+    response_conn: Any,
+) -> None:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    state = None
+    try:
+        from runtime.state import AppState
+        from runtime.task import TaskRunner, run_train_task
+
+        config = _build_runtime_config(config_payload)
+        state = AppState(config)
+        task = TaskRunner(state)
+        runtime_payload = dict(payload)
+        request_id = str(runtime_payload.get("requestId") or "").strip()
+
+        if kind == "trainVoice":
+            if not request_id:
+                raise ValueError("`requestId` is required")
+            state.tasks.set(
+                request_id,
+                {
+                    "taskId": request_id,
+                    "requestId": request_id,
+                    "status": "queued",
+                    "speaker": runtime_payload.get("speakerName"),
+                    "trainModelId": runtime_payload.get("modelId"),
+                    "createdAt": datetime.now().isoformat(),
+                    "updatedAt": datetime.now().isoformat(),
+                },
+            )
+            run_train_task(state, request_id, runtime_payload)
+            result = state.tasks.get(request_id) or {
+                "taskId": request_id,
+                "requestId": request_id,
+                "status": "completed",
+            }
+        elif kind == "translate":
+            result = task.transcribe(runtime_payload)
+        elif kind == "voiceDesign":
+            result = TaskRunner.serialize_audio_response(task.voice_design(runtime_payload))
+        elif kind == "clone":
+            result = TaskRunner.serialize_audio_response(task.clone(runtime_payload))
+        elif kind == "customVoice":
+            result = TaskRunner.serialize_audio_response(task.custom_voice(runtime_payload))
+        else:
+            raise ValueError(f"Unsupported runtime job kind: {kind}")
+
+        response_conn.send({"ok": True, "result": result})
+    except ChildProcessCanceledError as exc:
+        response_conn.send(
+            {
+                "ok": False,
+                "error": {
+                    "type": "RequestCanceledError",
+                    "message": str(exc),
+                },
+            }
+        )
+    except BaseException as exc:
+        response_conn.send(
+            {
+                "ok": False,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        )
+    finally:
+        try:
+            response_conn.close()
+        except Exception:
+            pass
+        if state is not None:
+            try:
+                state.close()
+            except Exception:
+                pass
+
+
+def _raise_runtime_error(error: Dict[str, Any]) -> None:
+    error_type = str(error.get("type") or "RuntimeError")
+    message = str(error.get("message") or "RuntimeError")
+    request_id = str(error.get("requestId") or "").strip() or None
+    kind = str(error.get("kind") or "").strip() or None
+    if error_type == "QueueFullError":
+        raise QueueFullError(message)
+    if error_type == "ConflictError":
+        raise ConflictError(message)
+    if error_type in {"FileNotFoundError", "RequestNotFoundError"}:
+        raise RequestNotFoundError(message)
+    if error_type == "RequestCanceledError":
+        raise RequestCanceledError(message, request_id=request_id, kind=kind)
+    exc_cls = getattr(builtins, error_type, None)
+    if isinstance(exc_cls, type) and issubclass(exc_cls, BaseException):
+        raise exc_cls(message)
+    raise RuntimeError(f"{error_type}: {message}")
+
+
+def _queued_snapshot_entry(request: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "jobId": request["jobId"],
+        "kind": request["kind"],
+        "requestId": request["requestId"],
+        "createdAt": request["createdAt"],
+        "status": request["status"],
+        "meta": dict(request.get("meta") or {}),
+    }
 
 
 class Executor:
     def __init__(self, config: Any):
-        self.config = _prepare_config(config)
-        self._tasks_lock = threading.Lock()
-        self._tasks: Dict[str, Dict[str, Any]] = {}
-        self._task_versions: Dict[str, int] = {}
-        self._task_conditions: Dict[str, threading.Condition] = {}
+        self.config = config
+        self._config_payload = {
+            "device": str(config.device),
+            "device_mode": str(getattr(config, "device_mode", "") or ""),
+            "device_name": str(getattr(config, "device_name", "") or ""),
+            "cpu_confirmed": str(config.device).strip().lower() == "cpu",
+            "dtype": str(config.dtype),
+            "flash_attn": bool(config.flash_attn),
+            "keep_warm": False,
+            "data_dir": str(Path(config.data_dir).resolve()),
+            "models_dir": str(Path(config.models_dir).resolve()),
+            "max_gpu_queue_size": int(config.max_gpu_queue_size),
+        }
         self._commands: "queue.Queue[Dict[str, Any]]" = queue.Queue()
-        self._events: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._state_lock = threading.Lock()
         self._closing = False
         self._closed = False
+        self._mp_ctx = mp.get_context("spawn")
         self._thread = threading.Thread(
             target=self._run_loop,
             name="qwen3-tts-executor",
@@ -125,191 +249,34 @@ class Executor:
         )
         self._thread.start()
 
-    def _start_task_thread(self, job: Dict[str, Any]) -> Dict[str, Any]:
-        active_snapshot = {
-            "jobId": job["jobId"],
-            "kind": job["kind"],
-            "createdAt": job["createdAt"],
-            "startedAt": datetime.now().isoformat(),
-            "meta": dict(job.get("meta") or {}),
-        }
-        active = {
-            **job,
-            "thread": None,
-            "final_message": None,
-            "activeSnapshot": active_snapshot,
-        }
-        if active["kind"] == "trainVoice":
-            task_id = str(active.get("taskId") or "").strip()
-            if task_id:
-                current_meta = self.get_task_meta(task_id) or dict(active.get("initialMeta") or {})
-                running_meta = dict(current_meta)
-                running_meta.update(
-                    {
-                        "taskId": task_id,
-                        "requestId": task_id,
-                        "status": "running",
-                        "jobId": active["jobId"],
-                        "updatedAt": datetime.now().isoformat(),
-                    }
-                )
-                self.set_task_meta(task_id, running_meta)
-        thread = threading.Thread(
-            target=self._run_task_thread,
-            args=(active,),
-            name=f"qwen3-tts-task-{job['kind']}",
-            daemon=True,
-        )
-        active["thread"] = thread
-        thread.start()
-        return active
-
-    def _run_task_thread(self, active: Dict[str, Any]) -> None:
-        final_message = self._execute_task(active)
-        self._events.put(
-            {
-                "type": "task_done",
-                "jobId": active["jobId"],
-                "message": final_message,
-            }
-        )
-
-    def _execute_task(self, active: Dict[str, Any]) -> Dict[str, Any]:
-        state = None
-        try:
-            from runtime.state import AppState
-            from runtime.task import TaskRunner, run_train_task
-
-            state = AppState(self.config)
-            kind = str(active["kind"])
-            payload = dict(active.get("payload") or {})
-
-            if kind == "trainVoice":
-                task_id = str(payload["taskId"])
-                initial_meta = dict(active.get("initialMeta") or {})
-                if initial_meta:
-                    initial_meta["jobId"] = active["jobId"]
-                    state.tasks.set(task_id, initial_meta)
-                run_train_task(
-                    state,
-                    task_id,
-                    payload,
-                    cancel_event=active.get("cancel_event"),
-                )
-                result = state.tasks.get(task_id) or {"taskId": task_id, "requestId": task_id, "status": "completed"}
-                return {"ok": True, "result": result}
-
-            task = TaskRunner(state)
-            if kind == "transcribe":
-                result: Any = task.transcribe(payload)
-            elif kind == "voiceDesign":
-                result = TaskRunner.serialize_audio_response(task.voice_design(payload))
-            elif kind == "clone":
-                result = TaskRunner.serialize_audio_response(task.clone(payload))
-            elif kind == "customVoice":
-                result = TaskRunner.serialize_audio_response(task.custom_voice(payload))
-            else:
-                raise ValueError(f"Unsupported runtime job kind: {kind}")
-            return {"ok": True, "result": result}
-        except BaseException as exc:
-            return {
-                "ok": False,
-                "error": {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
-            }
-        finally:
-            if state is not None:
-                try:
-                    state.close()
-                except Exception:
-                    pass
-
-    def set_task_meta(self, task_id: str, payload: Dict[str, Any]) -> None:
-        with self._tasks_lock:
-            self._tasks[task_id] = dict(payload)
-            self._task_versions[task_id] = self._task_versions.get(task_id, 0) + 1
-            condition = self._task_conditions.get(task_id)
-            if condition is None:
-                condition = threading.Condition(self._tasks_lock)
-                self._task_conditions[task_id] = condition
-            condition.notify_all()
-
-    def get_task_meta(self, task_id: str) -> Optional[Dict[str, Any]]:
-        with self._tasks_lock:
-            value = self._tasks.get(task_id)
-            return dict(value) if value else None
-
-    def task_snapshot(self, task_id: str) -> Optional[tuple[int, Dict[str, Any]]]:
-        with self._tasks_lock:
-            value = self._tasks.get(task_id)
-            if value is None:
-                return None
-            return self._task_versions.get(task_id, 0), dict(value)
-
-    def wait_for_task_update(
-        self,
-        task_id: str,
-        after_version: int,
-        timeout: Optional[float] = None,
-    ) -> Optional[tuple[int, Dict[str, Any]]]:
-        with self._tasks_lock:
-            condition = self._task_conditions.get(task_id)
-            if condition is None:
-                return None
-
-            def has_update() -> bool:
-                return self._task_versions.get(task_id, 0) > after_version
-
-            if not has_update():
-                condition.wait(timeout=timeout)
-            if not has_update():
-                return None
-            value = self._tasks.get(task_id)
-            if value is None:
-                return None
-            return self._task_versions.get(task_id, 0), dict(value)
-
     def snapshot(self) -> Dict[str, Any]:
         result = self._request({"type": "snapshot"})
         return dict(result or {})
 
-    def run(self, kind: str, payload: Dict[str, Any], *, meta: Optional[Dict[str, Any]] = None) -> Any:
+    def run_request(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+        *,
+        request_id: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         return self._request(
             {
-                "type": "run_job",
-                "kind": kind,
+                "type": "enqueue_request",
+                "kind": str(kind),
+                "request_id": str(request_id).strip(),
                 "payload": dict(payload),
                 "meta": dict(meta or {}),
             }
         )
 
-    def run_train(
-        self,
-        *,
-        task_id: str,
-        payload: Dict[str, Any],
-        meta: Dict[str, Any],
-        initial_meta: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    def cancel_request(self, request_id: str, *, kind: str) -> Dict[str, Any]:
         result = self._request(
             {
-                "type": "run_job",
-                "kind": "trainVoice",
-                "task_id": task_id,
-                "payload": dict(payload),
-                "meta": dict(meta),
-                "initial_meta": dict(initial_meta),
-            }
-        )
-        return dict(result or {})
-
-    def cancel_train(self, task_id: str) -> Dict[str, Any]:
-        result = self._request(
-            {
-                "type": "cancel_train_job",
-                "task_id": str(task_id).strip(),
+                "type": "cancel_request",
+                "request_id": str(request_id).strip(),
+                "kind": str(kind).strip(),
             }
         )
         return dict(result or {})
@@ -334,17 +301,24 @@ class Executor:
         if reply_queue is not None:
             reply_queue.put(payload)
 
-    def _reply_with_error(self, command: Dict[str, Any], error_type: str, message: str) -> None:
-        self._reply(
-            command,
-            {
-                "ok": False,
-                "error": {
-                    "type": error_type,
-                    "message": message,
-                },
-            },
-        )
+    def _reply_with_error(
+        self,
+        command: Dict[str, Any],
+        error_type: str,
+        message: str,
+        *,
+        request_id: str | None = None,
+        kind: str | None = None,
+    ) -> None:
+        error_payload: Dict[str, Any] = {
+            "type": error_type,
+            "message": message,
+        }
+        if request_id:
+            error_payload["requestId"] = request_id
+        if kind:
+            error_payload["kind"] = kind
+        self._reply(command, {"ok": False, "error": error_payload})
 
     def _request(self, payload: Dict[str, Any], *, timeout: Optional[float] = None) -> Any:
         with self._state_lock:
@@ -357,187 +331,234 @@ class Executor:
         message["reply_queue"] = reply_queue
         self._commands.put(message)
         try:
-            if timeout is None:
-                response = reply_queue.get()
-            else:
-                response = reply_queue.get(timeout=timeout)
+            response = reply_queue.get() if timeout is None else reply_queue.get(timeout=timeout)
         except queue.Empty as exc:
             raise TimeoutError("Timed out while waiting for executor response") from exc
         if not bool(response.get("ok")):
             _raise_runtime_error(dict(response.get("error") or {}))
         return response.get("result")
 
-    def _drain_task_events(self, active: Dict[str, Any]) -> None:
-        while True:
-            try:
-                event = self._events.get_nowait()
-            except queue.Empty:
-                return
-            if event.get("type") != "task_done":
-                continue
-            if event.get("jobId") != active["jobId"]:
-                continue
-            active["final_message"] = dict(event.get("message") or {})
-
-    def _merge_task_result(self, task_id: str, result: Dict[str, Any]) -> None:
-        current_meta = self.get_task_meta(task_id) or {}
-        merged_meta = dict(current_meta)
-        merged_meta.update(result)
-        self.set_task_meta(task_id, merged_meta)
-
-    def _finalize_active_job(self, active: Dict[str, Any]) -> None:
-        final_message = active.get("final_message")
-        if final_message is None:
-            final_message = {
-                "ok": False,
-                "error": {
-                    "type": "RuntimeError",
-                    "message": f"Runtime task for `{active['kind']}` exited without returning a result",
-                },
+    def _build_snapshot(self, active: Optional[Dict[str, Any]], pending: deque[Dict[str, Any]]) -> Dict[str, Any]:
+        active_snapshot = None
+        if active is not None:
+            active_snapshot = {
+                "jobId": active["jobId"],
+                "kind": active["kind"],
+                "requestId": active["requestId"],
+                "createdAt": active["createdAt"],
+                "startedAt": active.get("startedAt"),
+                "status": active.get("status"),
+                "pid": active.get("pid"),
+                "meta": dict(active.get("meta") or {}),
             }
+        return {
+            "activeJob": active_snapshot,
+            "queuedCount": len(pending),
+            "queuedJobs": [_queued_snapshot_entry(item) for item in pending],
+        }
 
-        task_id = str(active.get("taskId") or "").strip()
-        if task_id:
+    def _release_request_memory(self, request: Dict[str, Any]) -> None:
+        request["payload"] = None
+        request["reply_queue"] = None
+        request["cancel_waiters"] = []
+        request["result_conn"] = None
+        request["process"] = None
+
+    def _start_process(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        parent_conn, child_conn = self._mp_ctx.Pipe(duplex=False)
+        process = self._mp_ctx.Process(
+            target=run_child_task,
+            args=(self._config_payload, request["kind"], dict(request["payload"] or {}), child_conn),
+            name=f"qwen3-tts-{request['kind']}-{request['requestId']}",
+        )
+        process.start()
+        child_conn.close()
+        request["process"] = process
+        request["result_conn"] = parent_conn
+        request["pid"] = process.pid
+        request["startedAt"] = datetime.now().isoformat()
+        request["status"] = "running"
+        request["cancel_deadline"] = None
+        request["final_message"] = None
+        return request
+
+    def _close_active_handles(self, active: Dict[str, Any]) -> None:
+        result_conn = active.get("result_conn")
+        if result_conn is not None:
+            try:
+                result_conn.close()
+            except Exception:
+                pass
+            active["result_conn"] = None
+        process = active.get("process")
+        if process is not None:
+            try:
+                process.join(timeout=0)
+            except Exception:
+                pass
+
+    def _mark_canceled(self, request: Dict[str, Any]) -> None:
+        request["status"] = "canceled"
+        request["finishedAt"] = datetime.now().isoformat()
+
+    def _cancel_queued_request(self, pending: deque[Dict[str, Any]], request: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            pending.remove(request)
+        except ValueError:
+            pass
+        self._mark_canceled(request)
+        self._reply_with_error(
+            request,
+            "RequestCanceledError",
+            "Canceled by request",
+            request_id=request["requestId"],
+            kind=request["kind"],
+        )
+        self._release_request_memory(request)
+        return {"requestId": request["requestId"], "kind": request["kind"]}
+
+    def _begin_cancel_active(self, active: Dict[str, Any]) -> None:
+        if active.get("cancel_requested"):
+            return
+        active["cancel_requested"] = True
+        active["status"] = "canceling"
+        active["cancel_deadline"] = datetime.now() + timedelta(seconds=_CANCEL_TERMINATE_TIMEOUT_SECONDS)
+        process = active.get("process")
+        if process is not None and process.is_alive():
+            process.terminate()
+
+    def _drain_active_process(self, active: Dict[str, Any]) -> None:
+        result_conn = active.get("result_conn")
+        if result_conn is not None:
+            try:
+                if result_conn.poll():
+                    active["final_message"] = dict(result_conn.recv() or {})
+            except EOFError:
+                pass
+            except OSError:
+                pass
+
+        process = active.get("process")
+        if process is None:
+            return
+        if active.get("cancel_requested") and process.is_alive():
+            deadline = active.get("cancel_deadline")
+            if isinstance(deadline, datetime) and datetime.now() >= deadline:
+                process.kill()
+                active["cancel_deadline"] = None
+        if not process.is_alive() and active.get("final_message") is None:
+            if active.get("cancel_requested"):
+                active["final_message"] = {
+                    "ok": False,
+                    "error": {
+                        "type": "RequestCanceledError",
+                        "message": "Canceled by request",
+                        "requestId": active["requestId"],
+                        "kind": active["kind"],
+                    },
+                }
+            else:
+                active["final_message"] = {
+                    "ok": False,
+                    "error": {
+                        "type": "ChildResultUnavailableError",
+                        "message": f"Runtime task for `{active['kind']}` exited without returning a result",
+                        "requestId": active["requestId"],
+                        "kind": active["kind"],
+                    },
+                }
+
+    def _finalize_active_request(self, active: Dict[str, Any]) -> None:
+        final_message = dict(active.get("final_message") or {})
+        self._close_active_handles(active)
+
+        if active.get("cancel_requested"):
             if final_message.get("ok"):
-                result = final_message.get("result")
-                if isinstance(result, dict):
-                    self._merge_task_result(task_id, result)
+                active["status"] = "completed"
+                active["finishedAt"] = datetime.now().isoformat()
+                self._reply(active, final_message)
+                for waiter in list(active.get("cancel_waiters") or []):
+                    self._reply_with_error(
+                        waiter,
+                        "ConflictError",
+                        f"Request kind={active['kind']}, requestId={active['requestId']} finished before it could be canceled",
+                        request_id=active["requestId"],
+                        kind=active["kind"],
+                    )
             else:
                 error = dict(final_message.get("error") or {})
-                failed_meta = dict(self.get_task_meta(task_id) or active.get("initialMeta") or {})
-                failed_meta.update(
-                    {
-                        "taskId": task_id,
-                        "requestId": task_id,
-                        "status": "failed",
-                        "error": f"{error.get('type') or 'RuntimeError'}: {error.get('message') or 'Runtime failed'}",
-                        "updatedAt": datetime.now().isoformat(),
-                    }
-                )
-                self.set_task_meta(task_id, failed_meta)
-
-        if str(active.get("kind") or "") == "trainVoice":
-            cancel_waiters = list(active.get("cancel_waiters") or [])
-            if cancel_waiters:
-                terminal_meta = self.get_task_meta(task_id) if task_id else None
-                if terminal_meta is not None:
-                    for waiter in cancel_waiters:
-                        self._reply(waiter, {"ok": True, "result": terminal_meta})
+                if str(error.get("type") or "") == "RequestCanceledError":
+                    self._mark_canceled(active)
+                    self._reply_with_error(
+                        active,
+                        "RequestCanceledError",
+                        str(error.get("message") or "Canceled by request"),
+                        request_id=active["requestId"],
+                        kind=active["kind"],
+                    )
+                    for waiter in list(active.get("cancel_waiters") or []):
+                        self._reply(
+                            waiter,
+                            {
+                                "ok": True,
+                                "result": {"requestId": active["requestId"], "kind": active["kind"]},
+                            },
+                        )
                 else:
-                    for waiter in cancel_waiters:
-                        self._reply(waiter, final_message)
-
-        if active["commandType"] == "run_job":
+                    active["status"] = "failed"
+                    active["finishedAt"] = datetime.now().isoformat()
+                    self._reply(active, final_message)
+                    for waiter in list(active.get("cancel_waiters") or []):
+                        self._reply_with_error(
+                            waiter,
+                            "ConflictError",
+                            f"Request kind={active['kind']}, requestId={active['requestId']} failed before it could be canceled",
+                            request_id=active["requestId"],
+                            kind=active["kind"],
+                        )
+        else:
+            active["finishedAt"] = datetime.now().isoformat()
+            active["status"] = "completed" if final_message.get("ok") else "failed"
             self._reply(active, final_message)
-            return
 
-    def _fail_queued_job(self, job: Dict[str, Any], message: str) -> None:
-        error = {
-            "type": "RuntimeError",
-            "message": message,
-        }
-        task_id = str(job.get("taskId") or "").strip()
-        if task_id:
-            failed_meta = dict(job.get("initialMeta") or {})
-            failed_meta.update(
-                {
-                    "taskId": task_id,
-                    "requestId": task_id,
-                    "status": "failed",
-                    "error": f"{error['type']}: {error['message']}",
-                    "updatedAt": datetime.now().isoformat(),
-                }
-            )
-            self.set_task_meta(task_id, failed_meta)
-        if job["commandType"] == "run_job":
-            self._reply(job, {"ok": False, "error": error})
+        self._release_request_memory(active)
 
-    def _refresh_pending_train_queue_positions(self, pending_jobs: deque[Dict[str, Any]]) -> None:
-        position = 0
-        for job in pending_jobs:
-            if str(job.get("kind") or "") != "trainVoice":
-                continue
-            task_id = str(job.get("taskId") or "").strip()
-            if not task_id:
-                continue
-            position += 1
-            initial_meta = dict(job.get("initialMeta") or {})
-            initial_meta.update(
-                {
-                    "taskId": task_id,
-                    "requestId": task_id,
-                    "jobId": job["jobId"],
-                    "queuePosition": position,
-                    "updatedAt": datetime.now().isoformat(),
-                }
-            )
-            job["initialMeta"] = initial_meta
-            self._merge_task_result(task_id, initial_meta)
-
-    def _cancel_pending_train_job(
-        self,
-        pending_jobs: deque[Dict[str, Any]],
-        task_id: str,
-    ) -> Optional[Dict[str, Any]]:
-        for index, job in enumerate(pending_jobs):
-            if str(job.get("kind") or "") != "trainVoice":
-                continue
-            if str(job.get("taskId") or "").strip() != task_id:
-                continue
-            del pending_jobs[index]
-            canceled_meta = dict(job.get("initialMeta") or {})
-            canceled_meta.update(
-                {
-                    "taskId": task_id,
-                    "requestId": task_id,
-                    "status": "canceled",
-                    "jobId": job["jobId"],
-                    "error": None,
-                    "updatedAt": datetime.now().isoformat(),
-                }
-            )
-            self.set_task_meta(task_id, canceled_meta)
-            self._reply(job, {"ok": True, "result": canceled_meta})
-            self._refresh_pending_train_queue_positions(pending_jobs)
-            return canceled_meta
-        return None
-
-    def _shutdown_active_job(self, active: Dict[str, Any], message: str) -> None:
-        cancel_event = active.get("cancel_event")
-        if cancel_event is not None:
-            cancel_event.set()
-        active["final_message"] = {
-            "ok": False,
-            "error": {
-                "type": "RuntimeError",
-                "message": message,
-            },
-        }
-        self._finalize_active_job(active)
+    def _fail_pending_request(self, request: Dict[str, Any], message: str) -> None:
+        request["status"] = "failed"
+        request["finishedAt"] = datetime.now().isoformat()
+        self._reply_with_error(
+            request,
+            "RuntimeError",
+            message,
+            request_id=request["requestId"],
+            kind=request["kind"],
+        )
+        self._release_request_memory(request)
 
     def _run_loop(self) -> None:
-        pending_jobs: deque[Dict[str, Any]] = deque()
+        pending_requests: deque[Dict[str, Any]] = deque()
+        requests_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
         active: Optional[Dict[str, Any]] = None
         shutting_down = False
         running = True
 
         while running:
             if active is not None:
-                self._drain_task_events(active)
-                thread = active["thread"]
-                if active.get("final_message") is not None:
-                    self._finalize_active_job(active)
-                    active = None
-                elif not thread.is_alive():
-                    self._finalize_active_job(active)
+                self._drain_active_process(active)
+                process = active.get("process")
+                if process is None:
+                    if active.get("final_message") is not None:
+                        self._finalize_active_request(active)
+                        active = None
+                elif not process.is_alive():
+                    self._finalize_active_request(active)
                     active = None
 
-            if not shutting_down and active is None and pending_jobs:
-                active = self._start_task_thread(pending_jobs.popleft())
-                self._refresh_pending_train_queue_positions(pending_jobs)
+            if not shutting_down and active is None and pending_requests:
+                active = self._start_process(pending_requests.popleft())
                 continue
 
-            timeout = 0.1 if (active is not None or shutting_down) else None
+            timeout = 0.05 if (active is not None or shutting_down) else None
             try:
                 command = self._commands.get(timeout=timeout)
             except queue.Empty:
@@ -552,11 +573,10 @@ class Executor:
 
             if command_type == "shutdown":
                 shutting_down = True
-                while pending_jobs:
-                    self._fail_queued_job(pending_jobs.popleft(), "Executor is shutting down")
+                while pending_requests:
+                    self._fail_pending_request(pending_requests.popleft(), "Executor is shutting down")
                 if active is not None:
-                    self._shutdown_active_job(active, "Executor is shutting down")
-                    active = None
+                    self._begin_cancel_active(active)
                 continue
 
             if shutting_down:
@@ -564,122 +584,115 @@ class Executor:
                 continue
 
             if command_type == "snapshot":
-                self._reply(
-                    command,
-                    {
-                        "ok": True,
-                        "result": _make_snapshot(
-                            active["activeSnapshot"] if active is not None else None,
-                            pending_jobs,
-                        ),
-                    },
-                )
+                self._reply(command, {"ok": True, "result": self._build_snapshot(active, pending_requests)})
                 continue
 
-            if command_type == "cancel_train_job":
-                task_id = str(command.get("task_id") or "").strip()
-                if not task_id:
+            if command_type == "enqueue_request":
+                request_id = str(command.get("request_id") or "").strip()
+                kind = str(command.get("kind") or "").strip()
+                if not request_id:
                     self._reply_with_error(command, "ValueError", "`requestId` is required")
                     continue
-                canceled_meta = self._cancel_pending_train_job(pending_jobs, task_id)
-                if canceled_meta is not None:
-                    self._reply(command, {"ok": True, "result": canceled_meta})
+                if not kind:
+                    self._reply_with_error(command, "ValueError", "`kind` is required")
                     continue
-                if active is not None and str(active.get("kind") or "") == "trainVoice":
-                    active_task_id = str(active.get("taskId") or "").strip()
-                    if active_task_id == task_id:
-                        current_meta = self.get_task_meta(task_id) or dict(active.get("initialMeta") or {})
-                        current_status = str(current_meta.get("status") or "").strip().lower()
-                        if current_status in {"canceled", "cancelled"}:
-                            self._reply(command, {"ok": True, "result": current_meta})
-                            continue
-                        active.setdefault("cancel_waiters", []).append(command)
-                        if current_status == "canceling":
-                            continue
-                        cancel_event = active.get("cancel_event")
-                        if cancel_event is not None:
-                            cancel_event.set()
-                        canceling_meta = dict(current_meta)
-                        canceling_meta.update(
-                            {
-                                "taskId": task_id,
-                                "requestId": task_id,
-                                "status": "canceling",
-                                "jobId": active["jobId"],
-                                "error": None,
-                                "updatedAt": datetime.now().isoformat(),
-                            }
-                        )
-                        self.set_task_meta(task_id, canceling_meta)
-                        continue
-                existing_meta = self.get_task_meta(task_id)
-                if existing_meta is None:
-                    self._reply_with_error(command, "FileNotFoundError", f"Unknown train requestId: {task_id}")
+                key = _request_key(kind, request_id)
+                if key in requests_by_key:
+                    self._reply_with_error(
+                        command,
+                        "ConflictError",
+                        f"Request already exists: kind={kind}, requestId={request_id}",
+                        request_id=request_id,
+                        kind=kind,
+                    )
                     continue
-                existing_status = str(existing_meta.get("status") or "").strip().lower()
-                if existing_status in {"canceling", "canceled", "cancelled"}:
-                    self._reply(command, {"ok": True, "result": existing_meta})
+                if len(pending_requests) >= int(self.config.max_gpu_queue_size):
+                    self._reply_with_error(
+                        command,
+                        "QueueFullError",
+                        f"GPU queue is full (max={self.config.max_gpu_queue_size})",
+                        request_id=request_id,
+                        kind=kind,
+                    )
+                    continue
+                payload = dict(command.get("payload") or {})
+                payload["requestId"] = request_id
+                if kind == "trainVoice":
+                    payload["taskId"] = request_id
+                request = {
+                    "commandType": command_type,
+                    "kind": kind,
+                    "requestId": request_id,
+                    "payload": payload,
+                    "meta": dict(command.get("meta") or {}),
+                    "createdAt": datetime.now().isoformat(),
+                    "jobId": _make_job_id(kind),
+                    "reply_queue": command.get("reply_queue"),
+                    "cancel_waiters": [],
+                    "status": "queued",
+                    "process": None,
+                    "result_conn": None,
+                    "pid": None,
+                    "startedAt": None,
+                    "finishedAt": None,
+                    "final_message": None,
+                    "cancel_requested": False,
+                    "cancel_deadline": None,
+                }
+                requests_by_key[key] = request
+                pending_requests.append(request)
+                continue
+
+            if command_type == "cancel_request":
+                request_id = str(command.get("request_id") or "").strip()
+                kind = str(command.get("kind") or "").strip()
+                if not request_id:
+                    self._reply_with_error(command, "ValueError", "`requestId` is required")
+                    continue
+                if not kind:
+                    self._reply_with_error(command, "ValueError", "`kind` is required")
+                    continue
+                request = requests_by_key.get(_request_key(kind, request_id))
+                if request is None:
+                    self._reply_with_error(
+                        command,
+                        "RequestNotFoundError",
+                        f"Unknown request: kind={kind}, requestId={request_id}",
+                        request_id=request_id,
+                        kind=kind,
+                    )
+                    continue
+                status = str(request.get("status") or "").strip().lower()
+                if status == "queued":
+                    result = self._cancel_queued_request(pending_requests, request)
+                    self._reply(command, {"ok": True, "result": result})
+                    continue
+                if active is not None and active is request and status in {"running", "canceling"}:
+                    active.setdefault("cancel_waiters", []).append(command)
+                    self._begin_cancel_active(active)
+                    continue
+                if status == "canceled":
+                    self._reply(command, {"ok": True, "result": {"requestId": request_id, "kind": kind}})
+                    continue
+                if status in {"completed", "failed"}:
+                    self._reply_with_error(
+                        command,
+                        "ConflictError",
+                        f"Request kind={kind}, requestId={request_id} is already `{status}` and cannot be canceled",
+                        request_id=request_id,
+                        kind=kind,
+                    )
                     continue
                 self._reply_with_error(
                     command,
                     "ConflictError",
-                    f"Train requestId `{task_id}` is already `{existing_status or 'completed'}` and cannot be canceled",
+                    f"Request kind={kind}, requestId={request_id} is already `{status}` and cannot be canceled",
+                    request_id=request_id,
+                    kind=kind,
                 )
                 continue
 
-            if command_type != "run_job":
-                self._reply_with_error(command, "ValueError", f"Unsupported executor command: {command_type}")
-                continue
-
-            if len(pending_jobs) >= int(self.config.max_gpu_queue_size):
-                self._reply_with_error(
-                    command,
-                    "QueueFullError",
-                    f"GPU queue is full (max={self.config.max_gpu_queue_size})",
-                )
-                continue
-
-            kind = str(command["kind"])
-            payload = dict(command.get("payload") or {})
-            task_id = str(command.get("task_id") or payload.get("taskId") or "").strip()
-            if kind == "trainVoice":
-                if not task_id:
-                    self._reply_with_error(command, "ValueError", "`requestId` is required")
-                    continue
-                if self.get_task_meta(task_id) is not None:
-                    self._reply_with_error(command, "ConflictError", f"Train requestId already exists: {task_id}")
-                    continue
-
-            queued_job = {
-                "commandType": command_type,
-                "kind": kind,
-                "payload": payload,
-                "meta": dict(command.get("meta") or {}),
-                "createdAt": datetime.now().isoformat(),
-                "jobId": _make_job_id(kind),
-                "reply_queue": command.get("reply_queue"),
-                "taskId": task_id or None,
-                "initialMeta": dict(command.get("initial_meta") or {}),
-                "cancel_event": threading.Event() if kind == "trainVoice" else None,
-                "cancel_waiters": [] if kind == "trainVoice" else None,
-            }
-            pending_jobs.append(queued_job)
-
-            if kind == "trainVoice":
-                queued_meta = dict(queued_job["initialMeta"])
-                queued_meta.update(
-                    {
-                        "taskId": task_id,
-                        "requestId": task_id,
-                        "status": "queued",
-                        "jobId": queued_job["jobId"],
-                        "error": None,
-                        "updatedAt": datetime.now().isoformat(),
-                    }
-                )
-                queued_job["initialMeta"] = queued_meta
-                self.set_task_meta(task_id, queued_meta)
-                self._refresh_pending_train_queue_positions(pending_jobs)
+            self._reply_with_error(command, "ValueError", f"Unsupported executor command: {command_type}")
 
         with self._state_lock:
             self._closed = True

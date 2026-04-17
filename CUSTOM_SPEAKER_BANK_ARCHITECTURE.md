@@ -281,15 +281,16 @@ qwen_tts/training/
 
 1. 调用方先生成 `requestId`
 2. `POST /api/trainVoice?requestId={requestId}` 上传训练数据，并在同一条连接上等待训练终态
-3. 如用户中途取消，调用 `DELETE /api/trainVoice/{requestId}`
-4. 训练任务完成，导出 `speaker package`
-5. 校验 `speaker package` 完整性
-6. 校验 `speaker` 名称是否冲突
-7. 分配新的 `voiceId`
-8. 写入 `data/voices/{voiceId}/`
-9. 原子更新 `data/voices/index.json`
-10. 运行时 `voice_registry` 立即刷新当前进程内映射
-11. 终态返回给原始 `POST /api/trainVoice`
+3. 如用户中途取消，调用 `POST /api/cancel`
+4. body 传：`{"kind":"trainVoice","requestId":"..."}`
+5. 训练任务完成，导出 `speaker package`
+6. 校验 `speaker package` 完整性
+7. 校验 `speaker` 名称是否冲突
+8. 分配新的 `voiceId`
+9. 写入 `data/voices/{voiceId}/`
+10. 原子更新 `data/voices/index.json`
+11. 运行时 `voice_registry` 立即刷新当前进程内映射
+12. 终态返回给原始 `POST /api/trainVoice`
 
 训练接口的终态不是“preview_ready”，而是“registered”。
 
@@ -469,10 +470,12 @@ wavs, sr = model.generate_custom_voice(
   - 必须带 `requestId`
   - 请求保持到训练终态
   - 训练成功后立即注册 speaker
-- `DELETE /api/trainVoice/{requestId}`
-  - 触发取消
-  - 等待取消清理完成后返回终态
+- `POST /api/cancel`
+  - body 必须带 `kind` 和 `requestId`
+  - 触发统一取消
+  - 运行中任务会等对应 request-scoped worker 进程真正退出后再返回成功
 - `GET /api/voices`
+  - query 必须带 `speak_model_id`
   - 返回正式 speaker bank 条目
 - `DELETE /api/voices/{voiceId}`
   - 删除 speaker 并从运行时注册表反注册
@@ -484,7 +487,7 @@ wavs, sr = model.generate_custom_voice(
 - 不新增训练状态 SSE 接口
 - 不新增训练状态查询接口
 - `POST /api/trainVoice` 本身就是长连接，但只返回一次终态 JSON
-- `DELETE /api/trainVoice/{requestId}` 也可能是长连接，因为它要等取消真正完成
+- `POST /api/cancel` 也可能是长连接，因为它要等取消真正完成
 - 调用方必须自己持有 `requestId`，这样才能在训练未结束前发取消
 
 ### 11.3 Preview

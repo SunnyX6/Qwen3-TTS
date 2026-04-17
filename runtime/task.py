@@ -9,7 +9,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -818,7 +818,7 @@ class TaskRunner:
         if not requested_speaker:
             raise ValueError("`speaker` is required")
         runtime_model_id, runtime_model_ref = self._require_model(
-            str(payload.get("modelId") or self.state.config.custom_voice_model_id).strip(),
+            str(payload["modelId"]).strip(),
             supported_model_ids=CUSTOM_VOICE_MODEL_IDS,
             field_name="modelId",
         )
@@ -873,23 +873,8 @@ def write_train_log(task_id: str, speaker_name: str, message: str) -> None:
     _write_stdout_line(f"[train][{task_id}][{speaker_name}] {message}")
 
 
-class TrainCanceledError(RuntimeError):
-    pass
-
-
-def _raise_if_train_canceled(cancel_event: Optional[threading.Event]) -> None:
-    if cancel_event is not None and cancel_event.is_set():
-        raise TrainCanceledError("Canceled by request")
-
-
-def prepare_training_records(
-    payload: Dict[str, Any],
-    *,
-    check_cancel: Optional[Callable[[], None]] = None,
-) -> tuple[List[Dict[str, Any]], List[str]]:
+def prepare_training_records(payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[str]]:
     logs: List[str] = []
-    if check_cancel is not None:
-        check_cancel()
     ref_audio, ref_sample_rate = _load_demo_audio_bytes(
         payload["refAudioBytes"],
         target_sample_rate=TRAINING_AUDIO_SAMPLE_RATE,
@@ -902,8 +887,6 @@ def prepare_training_records(
     )
     records: List[Dict[str, Any]] = []
     for index, sample in enumerate(payload["samples"], start=1):
-        if check_cancel is not None:
-            check_cancel()
         sample_audio, sample_rate = _load_demo_audio_bytes(
             sample["audioBytes"],
             target_sample_rate=TRAINING_AUDIO_SAMPLE_RATE,
@@ -921,8 +904,6 @@ def prepare_training_records(
             "Prepared sample audio in memory "
             f"(#{index} {sample.get('audioFilename') or 'sample'} -> {sample_rate}Hz)"
         )
-        if check_cancel is not None:
-            check_cancel()
     return records, logs
 
 
@@ -982,19 +963,13 @@ def run_train_task(
     state: Any,
     task_id: str,
     payload: Dict[str, Any],
-    *,
-    cancel_event: Optional[threading.Event] = None,
 ) -> None:
     speaker_name = payload["speakerName"]
     log = lambda message: write_train_log(task_id, speaker_name, message)
 
-    def check_cancel() -> None:
-        _raise_if_train_canceled(cancel_event)
-
     try:
         from qwen_tts.training import SpeakerPackageTrainConfig, encode_training_records, train_speaker_package
 
-        check_cancel()
         resolved_train_model_id, resolved_runtime_model_id = resolve_train_model_pair(
             payload["modelId"],
             state.config.models_dir,
@@ -1017,11 +992,9 @@ def run_train_task(
         log(f"Training source model: {resolved_train_model_id}")
         log(f"Runtime CustomVoice backbone: {resolved_runtime_model_id}")
         log(f"Tokenizer model: {resolved_tokenizer_model_id}")
-        check_cancel()
-        train_records, preparation_logs = prepare_training_records(payload, check_cancel=check_cancel)
+        train_records, preparation_logs = prepare_training_records(payload)
         for message in preparation_logs:
             log(message)
-        check_cancel()
         encoded_records = encode_training_records(
             records=train_records,
             tokenizer_model_path=resolved_tokenizer_model_id,
@@ -1029,14 +1002,12 @@ def run_train_task(
             models_dir=state.config.models_dir,
             audio_sample_rate=TRAINING_AUDIO_SAMPLE_RATE,
             log_fn=log,
-            cancel_fn=check_cancel,
         )
         with tempfile.TemporaryDirectory(
             prefix=f"qwen3_tts_train_{task_id}_",
             dir=state.train_tmp_root_dir(),
         ) as temp_dir:
             train_output_dir = _ensure_dir(Path(temp_dir) / "export")
-            check_cancel()
             train_result = train_speaker_package(
                 SpeakerPackageTrainConfig(
                     train_model_id=resolved_train_model_id,
@@ -1055,9 +1026,7 @@ def run_train_task(
                     models_dir=state.config.models_dir,
                 ),
                 log_fn=log,
-                cancel_fn=check_cancel,
             )
-            check_cancel()
             registered_voice = register_trained_voice(
                 state,
                 task_id=task_id,
@@ -1080,20 +1049,6 @@ def run_train_task(
             },
         )
         state.tasks.set(task_id, registered_meta)
-    except TrainCanceledError as exc:
-        log(f"[CANCELED] {exc}")
-        canceled_meta = update_task_meta(
-            state.tasks.get(task_id),
-            {
-                "taskId": task_id,
-                "requestId": task_id,
-                "status": "canceled",
-                "voiceId": None,
-                "error": None,
-                "updatedAt": datetime.now().isoformat(),
-            },
-        )
-        state.tasks.set(task_id, canceled_meta)
     except Exception as exc:
         log(f"[ERROR] {type(exc).__name__}: {exc}")
         failed_meta = update_task_meta(
